@@ -82,10 +82,15 @@ python chrome_hearts_monitor.py --loop             # what Railway runs
 
 `CATEGORIES` in `chrome_hearts_monitor.py` is the full known slug list — the few
 that are usually live plus ~28 valid-but-usually-empty ones that populate when a
-drop lands. **Known gap:** fine jewelry (rings/necklaces/bracelets) has no
-working top-level slug observed live; `/ring`, `/jewelry`, etc. 404. The homepage
-sweep is the safety net for featured drops meanwhile — once a real jewelry drop
-is caught, read its category from the product URL and add that slug here.
+drop lands. Each sweep also discovers same-site top-level category links from
+the homepage/category HTML and crawls a small capped number of those dynamically,
+so a newly linked slug can be checked before it is manually added to the list.
+
+**Known gap:** fine jewelry (rings/necklaces/bracelets) has no working top-level
+slug observed live; `/ring`, `/jewelry`, etc. 404. The homepage sweep plus
+dynamic link discovery is the safety net for featured/newly linked drops
+meanwhile — once a real jewelry drop is caught, read its category from the
+product URL and add that slug here.
 
 ## Other notification backends
 

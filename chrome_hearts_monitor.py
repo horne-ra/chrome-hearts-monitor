@@ -39,6 +39,7 @@ import sys
 import time
 from dataclasses import dataclass, asdict
 from pathlib import Path
+from urllib.parse import urlparse
 
 import requests
 
@@ -80,13 +81,20 @@ HEADERS = {
 INTRA_DELAY = (0.2, 0.6)
 REQUEST_TIMEOUT = 25
 MAX_RETRIES = 3
+MAX_DISCOVERED_CATEGORIES = 12
 
 METADATA_RE = re.compile(
     r'<span[^>]*class="[^"]*product-metadata[^"]*"[^>]*></span>',
     re.IGNORECASE | re.DOTALL,
 )
 ATTR_RE = re.compile(r'data-([a-z]+)="([^"]*)"', re.IGNORECASE)
+HREF_RE = re.compile(r'href="([^"]+)"', re.IGNORECASE)
 LINK_RE_TMPL = r'href="(/[a-z0-9\-]+/[a-z0-9\-]+/{pid}\.html)"'
+
+UTILITY_SLUGS = {
+    "account", "cart", "checkout", "contact-us", "customer-service", "login",
+    "order-status", "privacy-policy", "search", "stores", "wishlist",
+}
 
 
 @dataclass
@@ -141,14 +149,48 @@ def parse_products(html: str) -> dict[str, Product]:
     return found
 
 
+def discover_category_paths(html: str) -> list[str]:
+    """Find same-site top-level category URLs newly linked from fetched pages."""
+    paths: list[str] = []
+    for href in HREF_RE.findall(html):
+        parsed = urlparse(href)
+        if parsed.netloc and parsed.netloc != "www.chromehearts.com":
+            continue
+        path = parsed.path.rstrip("/")
+        parts = [p for p in path.split("/") if p]
+        if len(parts) != 1:
+            continue
+        slug = parts[0].lower()
+        if slug in UTILITY_SLUGS or not re.fullmatch(r"[a-z0-9\-]+", slug):
+            continue
+        candidate = f"/{slug}"
+        if candidate not in paths:
+            paths.append(candidate)
+    return paths
+
+
 def crawl(session: requests.Session) -> dict[str, Product]:
     catalog: dict[str, Product] = {}
-    for path in ["/"] + [f"/{c}" for c in CATEGORIES]:
+    queued = ["/"] + [f"/{c}" for c in CATEGORIES]
+    seen: set[str] = set()
+    discovered = 0
+    for path in queued:
+        if path in seen:
+            continue
+        seen.add(path)
         r = fetch(session, BASE + path)
         time.sleep(random.uniform(*INTRA_DELAY))
         if r is None or r.status_code != 200:
             continue
-        catalog.update(parse_products(r.text))  # empty pages add nothing
+        html = r.text
+        catalog.update(parse_products(html))  # empty pages add nothing
+        for discovered_path in discover_category_paths(html):
+            if discovered >= MAX_DISCOVERED_CATEGORIES:
+                break
+            if discovered_path in seen or discovered_path in queued:
+                continue
+            queued.append(discovered_path)
+            discovered += 1
     return catalog
 
 
@@ -249,12 +291,13 @@ def main() -> int:
     if not args.loop:
         ap.error("choose a mode: --loop, --once, or --seed")
 
-    log(f"Chrome Hearts monitor online. {len(CATEGORIES)} categories + homepage, "
+    log(f"Chrome Hearts monitor online. {len(CATEGORIES)} base categories + homepage, "
         f"~{POLL_SECONDS}s sweeps. state={STATE_FILE}")
     if STARTUP_PING and not args.dry_run:
         try:
             _send(f"\U0001f7e2 Chrome Hearts monitor online — watching "
-                  f"{len(CATEGORIES)} categories, ~{POLL_SECONDS}s sweeps.")
+                  f"{len(CATEGORIES)} base categories + discovered links, "
+                  f"~{POLL_SECONDS}s sweeps.")
         except Exception as exc:  # don't die if the first ping fails
             log(f"startup ping failed: {exc}")
 
