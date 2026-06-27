@@ -1,0 +1,17 @@
+# secrets — set these as Railway Variables, never commit them
+.env
+
+# local state (on Railway this lives on a mounted volume, not in the repo)
+seen_products.json
+*.tmp
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# editor / OS
+.DS_Store
+.idea/
+.vscode/
