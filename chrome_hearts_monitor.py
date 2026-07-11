@@ -96,6 +96,28 @@ UTILITY_SLUGS = {
     "order-status", "privacy-policy", "search", "stores", "wishlist",
 }
 
+SIZE_CODES = {
+    "XSM": "Extra Small",
+    "SML": "Small",
+    "MED": "Medium",
+    "LRG": "Large",
+    "1XL": "XL",
+    "2XL": "2XL",
+    "3XL": "3XL",
+    "4XL": "4XL",
+    "5XL": "5XL",
+    # Chrome Hearts sometimes uses XXX as a size-like SKU segment; keep it raw
+    # instead of guessing wrong in a time-sensitive alert.
+    "XXX": "XXX",
+    "OS": "One Size",
+}
+
+SIZED_CATEGORY_SLUGS = {
+    "boxers-leggings", "denim", "hoodie", "hoodies", "intimates", "jacket",
+    "pants", "shirt", "shirts", "shorts", "sweater", "sweatshirt",
+    "sweatshirts", "t-shirt", "t-shirts",
+}
+
 
 @dataclass
 class Product:
@@ -104,10 +126,12 @@ class Product:
     price: str
     category: str
     url: str
+    size: str = ""
 
     def pretty(self) -> str:
         price = f"${self.price}" if self.price else "price n/a"
-        return f"{self.name} ({price})\n{self.url}"
+        size = f"\nSize: {self.size}" if self.size else ""
+        return f"{self.name} ({price}){size}\n{self.url}"
 
 
 # --------------------------------------------------------------------------- #
@@ -139,14 +163,34 @@ def parse_products(html: str) -> dict[str, Product]:
             continue
         m = re.search(LINK_RE_TMPL.format(pid=re.escape(pid)), html)
         path = m.group(1) if m else f"/p/{pid}.html"
+        category = attrs.get("category", "").strip()
+        category_hint = category or path.strip("/").split("/", 1)[0]
         found[pid] = Product(
             pid=pid,
             name=attrs.get("name", "").strip() or "(unnamed)",
             price=attrs.get("price", "").strip(),
-            category=attrs.get("category", "").strip(),
+            category=category,
             url=BASE + path,
+            size=infer_size(pid, category_hint),
         )
     return found
+
+
+def category_slug(category: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", category.lower()).strip("-")
+
+
+def infer_size(pid: str, category: str = "") -> str:
+    """Infer apparel size from the SKU/PID without adding any extra requests."""
+    if category and category_slug(category) not in SIZED_CATEGORY_SLUGS:
+        return ""
+    upper_pid = pid.upper()
+    for code in sorted(SIZE_CODES, key=len, reverse=True):
+        prefix_guard = r"(?<!X)" if code == "XXX" else ""
+        if re.search(rf"{prefix_guard}{re.escape(code)}\d{{3}}$", upper_pid):
+            label = SIZE_CODES[code]
+            return label if label == code else f"{label} ({code})"
+    return ""
 
 
 def discover_category_paths(html: str) -> list[str]:
@@ -232,7 +276,8 @@ def notify_new(products: list[Product]) -> None:
     lines = [f"\U0001f6a8 {len(products)} new Chrome Hearts items:"]
     for p in products[:MAX_INDIVIDUAL]:
         price = f"${p.price}" if p.price else ""
-        lines.append(f"\u2022 {p.name} {price} {p.url}")
+        size = f" [{p.size}]" if p.size else ""
+        lines.append(f"\u2022 {p.name}{size} {price} {p.url}")
     lines.append(f"...and {len(products) - MAX_INDIVIDUAL} more.")
     _send("\n".join(lines))
 

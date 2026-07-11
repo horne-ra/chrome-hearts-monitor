@@ -9,6 +9,16 @@ CH LOGO SOCKS ($255.00)
 https://www.chromehearts.com/socks/ch-logo-socks/176354XXXXXX349.html
 ```
 
+For apparel links that encode size in the product id, alerts include the
+inferred size without making any extra requests:
+
+```
+🚨 New Chrome Hearts drop
+SHORT SLEEVE POCKET CREW ($320.00)
+Size: Medium (MED)
+https://www.chromehearts.com/shirt/short-sleeve-pocket-crew/129111BLKMED756.html
+```
+
 ## How it works
 
 Chrome Hearts runs a Salesforce Commerce Cloud (Demandware/SFRA) storefront
@@ -23,7 +33,8 @@ The worker runs forever. Each ~30s sweep:
    trickle of requests (reads like browsing, not a burst — keeps Cloudflare calm).
 2. Builds the live product set, keyed by product id (PID).
 3. Diffs against the saved snapshot; PIDs never seen before are "new."
-4. Posts new items to Discord, then saves the snapshot.
+4. Infers size from the PID/link when Chrome Hearts encodes one in the SKU.
+5. Posts new items to Discord, then saves the snapshot.
 
 Keying on PID means it catches genuinely new items even inside categories that
 already had products. The first sweep with no prior snapshot **seeds silently**
