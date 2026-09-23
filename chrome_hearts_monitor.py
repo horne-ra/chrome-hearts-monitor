@@ -37,12 +37,13 @@ import random
 import re
 import sys
 import time
-import xml.etree.ElementTree as ET
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 import requests
+from defusedxml import ElementTree as ET
+from defusedxml.common import DefusedXmlException
 
 # --------------------------------------------------------------------------- #
 # Config
@@ -271,7 +272,7 @@ def sitemap_category_paths(session: requests.Session) -> list[str]:
                     paths.append(path)
         _sitemap_paths = paths
         return paths
-    except (requests.RequestException, ET.ParseError) as exc:
+    except (requests.RequestException, ET.ParseError, DefusedXmlException) as exc:
         log(f"sitemap refresh failed: {exc}")
         return _sitemap_paths
 
@@ -462,17 +463,19 @@ def main() -> int:
         except Exception as exc:  # don't die if the first ping fails
             log(f"startup ping failed: {exc}")
 
-    last_health_alert = 0.0
+    last_health_alert = None
     while True:
         t0 = time.monotonic()
         try:
             sweep(session, seed=False, dry_run=args.dry_run)
         except Exception as exc:  # never let one bad sweep kill the worker
             log(f"sweep error (continuing): {exc!r}")
-            if not args.dry_run and time.monotonic() - last_health_alert >= HEALTH_ALERT_SECONDS:
-                last_health_alert = time.monotonic()
+            if (not args.dry_run and
+                    (last_health_alert is None or
+                     time.monotonic() - last_health_alert >= HEALTH_ALERT_SECONDS)):
                 try:
                     _send(f"\u26a0\ufe0f Chrome Hearts product monitor needs attention: {exc}")
+                    last_health_alert = time.monotonic()
                 except Exception as alert_exc:
                     log(f"health alert failed: {alert_exc!r}")
         elapsed = time.monotonic() - t0

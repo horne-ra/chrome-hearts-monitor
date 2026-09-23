@@ -1,5 +1,6 @@
 import unittest
 import tempfile
+import sys
 from pathlib import Path
 from unittest.mock import patch
 
@@ -67,6 +68,21 @@ class ProductDiscoveryTests(unittest.TestCase):
              patch.object(monitor, "_sitemap_paths", []):
             self.assertEqual(monitor.sitemap_category_paths(Session()), ['/new-category'])
 
+    def test_sitemap_rejects_entity_declarations(self):
+        class Response:
+            content = b'<!DOCTYPE x [<!ENTITY x "bad">]><sitemapindex><loc>&x;</loc></sitemapindex>'
+
+            def raise_for_status(self):
+                pass
+
+        class Session:
+            def get(self, url, timeout):
+                return Response()
+
+        with patch.object(monitor, "_sitemap_checked_at", 0.0), \
+             patch.object(monitor, "_sitemap_paths", ['/known']):
+            self.assertEqual(monitor.sitemap_category_paths(Session()), ['/known'])
+
     def test_dry_run_does_not_mark_product_seen(self):
         with tempfile.TemporaryDirectory() as directory:
             state = Path(directory) / 'seen.json'
@@ -127,11 +143,49 @@ class ProductDiscoveryTests(unittest.TestCase):
     def test_discord_http_error_is_a_delivery_failure(self):
         class Response:
             status_code = 429
+            text = 'rate limited'
 
         with patch.dict(notifier.os.environ, {'DISCORD_WEBHOOK_URL': 'https://example.test/webhook'}), \
              patch.object(notifier.requests, 'post', return_value=Response()):
-            with self.assertRaisesRegex(RuntimeError, 'HTTP 429'):
+            with self.assertRaisesRegex(RuntimeError, "HTTP 429: 'rate limited'"):
                 notifier._send_discord('test')
+
+    def test_twilio_http_error_includes_bounded_response(self):
+        class Response:
+            status_code = 400
+            text = 'x' * 250
+
+        env = {'TWILIO_ACCOUNT_SID': 'test', 'TWILIO_AUTH_TOKEN': 'test',
+               'TWILIO_FROM': '+10000000000', 'TWILIO_TO': '+19999999999'}
+        with patch.dict(notifier.os.environ, env), \
+             patch.object(notifier.requests, 'post', return_value=Response()):
+            with self.assertRaises(RuntimeError) as caught:
+                notifier._send_twilio('test')
+        self.assertIn('HTTP 400', str(caught.exception))
+        self.assertIn('x' * 200, str(caught.exception))
+        self.assertNotIn('x' * 201, str(caught.exception))
+
+    def test_wrapped_http_error_keeps_response_content(self):
+        response = notifier.requests.Response()
+        response.status_code = 403
+        response._content = b'forbidden'
+        error = notifier.requests.HTTPError(response=response)
+        with patch.dict(notifier.os.environ, {'DISCORD_WEBHOOK_URL': 'https://example.test/webhook'}), \
+             patch.object(notifier.requests, 'post', side_effect=error):
+            with self.assertRaisesRegex(RuntimeError, "HTTP 403: 'forbidden'"):
+                notifier._send_discord('test')
+
+    def test_failed_health_alert_retries_then_throttles_after_success(self):
+        with patch.object(sys, 'argv', ['monitor', '--loop']), \
+             patch.object(monitor, 'STARTUP_PING', False), \
+             patch.object(monitor.requests, 'Session'), \
+             patch.object(monitor, 'sweep', side_effect=RuntimeError('crawl failed')), \
+             patch.object(monitor, '_send', side_effect=[RuntimeError('send failed'), None]) as send, \
+             patch.object(monitor.time, 'monotonic', return_value=10.0), \
+             patch.object(monitor.time, 'sleep', side_effect=[None, None, StopIteration]):
+            with self.assertRaises(StopIteration):
+                monitor.main()
+        self.assertEqual(send.call_count, 2)
 
 
 if __name__ == "__main__":
