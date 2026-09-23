@@ -39,9 +39,11 @@ import sys
 import time
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 import requests
+from defusedxml import ElementTree as ET
+from defusedxml.common import DefusedXmlException
 
 # --------------------------------------------------------------------------- #
 # Config
@@ -53,6 +55,9 @@ POLL_SECONDS = int(os.environ.get("CH_POLL_SECONDS", "30"))
 MAX_INDIVIDUAL = int(os.environ.get("CH_MAX_INDIVIDUAL", "8"))
 STARTUP_PING = os.environ.get("CH_STARTUP_PING", "1") == "1"
 SUMMARY_MESSAGE_LIMIT = 1850  # leave headroom below Discord's 2,000-char limit
+SITEMAP_INDEX = BASE + "/sitemap_index.xml"
+SITEMAP_REFRESH_SECONDS = 600
+HEALTH_ALERT_SECONDS = 3600
 
 # Broad net: every known category slug. Live ones render grids; the rest are
 # valid-but-usually-empty and populate when a drop lands -- which is the point.
@@ -68,6 +73,11 @@ CATEGORIES = [
     "scarf", "tie",
 ]
 
+# Some storefront categories are only exposed through Search-Show menu links.
+# SWEATPANTS currently redirects to its sole product, rather than a product grid.
+CATEGORY_IDS = ["SWEATPANTS"]
+CATEGORY_ENDPOINT = "/on/demandware.store/Sites-ChromeHearts-Site/en_US/Search-Show"
+
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -82,7 +92,6 @@ HEADERS = {
 INTRA_DELAY = (0.2, 0.6)
 REQUEST_TIMEOUT = 25
 MAX_RETRIES = 3
-MAX_DISCOVERED_CATEGORIES = 12
 
 METADATA_RE = re.compile(
     r'<span[^>]*class="[^"]*product-metadata[^"]*"[^>]*></span>',
@@ -90,12 +99,16 @@ METADATA_RE = re.compile(
 )
 ATTR_RE = re.compile(r'data-([a-z]+)="([^"]*)"', re.IGNORECASE)
 HREF_RE = re.compile(r'href="([^"]+)"', re.IGNORECASE)
-LINK_RE_TMPL = r'href="(/[a-z0-9\-]+/[a-z0-9\-]+/{pid}\.html)"'
+LINK_RE_TMPL = r'href="(/[a-z0-9\-]+(?:/[a-z0-9\-]+)*/{pid}\.html(?:\?[^\"]*)?)"'
 
 UTILITY_SLUGS = {
-    "account", "cart", "checkout", "contact-us", "customer-service", "login",
-    "order-status", "privacy-policy", "search", "stores", "wishlist",
+    "account", "cart", "checkout", "contact", "contact-us", "customer-service",
+    "locations", "login", "magazine", "order-status", "privacy-policy",
+    "search", "shop", "stores", "wishlist",
 }
+
+_sitemap_paths: list[str] = []
+_sitemap_checked_at = 0.0
 
 SIZE_CODES = {
     "XSM": "Extra Small",
@@ -155,7 +168,7 @@ def fetch(session: requests.Session, url: str) -> requests.Response | None:
     return None
 
 
-def parse_products(html: str) -> dict[str, Product]:
+def parse_products(html: str, page_url: str = "") -> dict[str, Product]:
     found: dict[str, Product] = {}
     for span in METADATA_RE.findall(html):
         attrs = {k.lower(): v for k, v in ATTR_RE.findall(span)}
@@ -163,7 +176,13 @@ def parse_products(html: str) -> dict[str, Product]:
         if not pid:
             continue
         m = re.search(LINK_RE_TMPL.format(pid=re.escape(pid)), html)
-        path = m.group(1) if m else f"/p/{pid}.html"
+        page_path = urlparse(page_url).path
+        if m:
+            path = m.group(1)
+        elif page_path.endswith(f"/{pid}.html"):
+            path = page_url.removeprefix(BASE)
+        else:
+            path = f"/p/{pid}.html"
         category = attrs.get("category", "").strip()
         category_hint = category or path.strip("/").split("/", 1)[0]
         found[pid] = Product(
@@ -195,11 +214,19 @@ def infer_size(pid: str, category: str = "") -> str:
 
 
 def discover_category_paths(html: str) -> list[str]:
-    """Find same-site top-level category URLs newly linked from fetched pages."""
+    """Find same-site category links in fetched HTML, including Search-Show IDs."""
+    menu_paths: list[str] = []
     paths: list[str] = []
     for href in HREF_RE.findall(html):
         parsed = urlparse(href)
         if parsed.netloc and parsed.netloc != "www.chromehearts.com":
+            continue
+        if parsed.path == CATEGORY_ENDPOINT:
+            category_ids = parse_qs(parsed.query).get("cgid", [])
+            if len(category_ids) == 1 and re.fullmatch(r"[A-Za-z0-9_-]+", category_ids[0]):
+                candidate = f"{CATEGORY_ENDPOINT}?cgid={category_ids[0]}"
+                if candidate not in menu_paths:
+                    menu_paths.append(candidate)
             continue
         path = parsed.path.rstrip("/")
         parts = [p for p in path.split("/") if p]
@@ -211,32 +238,79 @@ def discover_category_paths(html: str) -> list[str]:
         candidate = f"/{slug}"
         if candidate not in paths:
             paths.append(candidate)
-    return paths
+    return menu_paths + paths
 
 
-def crawl(session: requests.Session) -> dict[str, Product]:
+def sitemap_category_paths(session: requests.Session) -> list[str]:
+    """Refresh the storefront's published category list at most every 10 minutes."""
+    global _sitemap_paths, _sitemap_checked_at
+    now = time.monotonic()
+    if _sitemap_checked_at and now - _sitemap_checked_at < SITEMAP_REFRESH_SECONDS:
+        return _sitemap_paths
+    _sitemap_checked_at = now
+    try:
+        index = session.get(SITEMAP_INDEX, timeout=10)
+        index.raise_for_status()
+        sitemap_urls = [node.text for node in ET.fromstring(index.content).iter()
+                        if node.tag.endswith("}loc") and node.text]
+        paths = []
+        for url in sitemap_urls[:4]:
+            if urlparse(url).netloc != "www.chromehearts.com":
+                continue
+            response = session.get(url, timeout=10)
+            response.raise_for_status()
+            for node in ET.fromstring(response.content).iter():
+                if not node.tag.endswith("}loc") or not node.text:
+                    continue
+                parsed = urlparse(node.text)
+                if parsed.netloc != "www.chromehearts.com":
+                    continue
+                path = parsed.path.rstrip("/")
+                slug = path.lstrip("/").lower()
+                if (re.fullmatch(r"/[a-z0-9-]+", path) and
+                        slug not in UTILITY_SLUGS and path not in paths):
+                    paths.append(path)
+        _sitemap_paths = paths
+        return paths
+    except (requests.RequestException, ET.ParseError, DefusedXmlException) as exc:
+        log(f"sitemap refresh failed: {exc}")
+        return _sitemap_paths
+
+
+def crawl(session: requests.Session) -> tuple[dict[str, Product], int]:
     catalog: dict[str, Product] = {}
-    queued = ["/"] + [f"/{c}" for c in CATEGORIES]
+    queued = (["/"] + [f"/{c}" for c in CATEGORIES] +
+              [f"{CATEGORY_ENDPOINT}?cgid={cid}" for cid in CATEGORY_IDS] +
+              sitemap_category_paths(session))
     seen: set[str] = set()
     discovered = 0
+    fetched = 0
+    missing = 0
+    errors = 0
     for path in queued:
         if path in seen:
             continue
         seen.add(path)
         r = fetch(session, BASE + path)
         time.sleep(random.uniform(*INTRA_DELAY))
-        if r is None or r.status_code != 200:
+        if r is None:
+            errors += 1
             continue
+        if r.status_code != 200:
+            missing += 1
+            continue
+        fetched += 1
         html = r.text
-        catalog.update(parse_products(html))  # empty pages add nothing
+        catalog.update(parse_products(html, r.url))  # empty pages add nothing
         for discovered_path in discover_category_paths(html):
-            if discovered >= MAX_DISCOVERED_CATEGORIES:
-                break
             if discovered_path in seen or discovered_path in queued:
                 continue
             queued.append(discovered_path)
             discovered += 1
-    return catalog
+    log(f"crawl coverage: {fetched} pages fetched, {missing} unavailable, "
+        f"{errors} fetch errors, "
+        f"{discovered} discovered categories, {len(catalog)} products")
+    return catalog, errors
 
 
 # --------------------------------------------------------------------------- #
@@ -244,10 +318,7 @@ def crawl(session: requests.Session) -> dict[str, Product]:
 # --------------------------------------------------------------------------- #
 
 def load_state() -> dict[str, dict]:
-    try:
-        return json.loads(STATE_FILE.read_text())
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
+    return json.loads(STATE_FILE.read_text())
 
 
 def save_state(catalog: dict[str, Product | dict]) -> None:
@@ -322,19 +393,27 @@ def notify_new(products: list[Product]) -> None:
 # --------------------------------------------------------------------------- #
 
 def sweep(session: requests.Session, *, seed: bool, dry_run: bool) -> None:
-    catalog = crawl(session)
-    previous = load_state()
-
-    if seed or not previous:
+    catalog, fetch_errors = crawl(session)
+    if not catalog:
+        raise RuntimeError("crawl found no products; refusing to update state")
+    if seed:
+        if fetch_errors:
+            raise RuntimeError("cannot seed while category fetches are failing")
         save_state(catalog)
         log(f"seeded {len(catalog)} products (no notifications).")
         return
+    previous = load_state()
+    if not previous:
+        raise RuntimeError("state is empty; run --seed explicitly after inspecting the catalog")
 
     new = [catalog[pid] for pid in catalog if pid not in previous]
     seen = {**previous, **{pid: asdict(p) for pid, p in catalog.items()}}
     if not new:
         log(f"{len(catalog)} live, 0 new.")
-        save_state(seen)
+        if not dry_run:
+            save_state(seen)
+            if fetch_errors:
+                raise RuntimeError(f"{fetch_errors} category fetches failed; catalog coverage may be incomplete")
         return
 
     log(f"{len(catalog)} live, {len(new)} NEW:")
@@ -342,10 +421,12 @@ def sweep(session: requests.Session, *, seed: bool, dry_run: bool) -> None:
         log("   + " + p.pretty().replace("\n", " | "))
     if dry_run:
         log("[dry-run] not sending.")
-    else:
-        notify_new(new)
-        log("notified.")
+        return
+    notify_new(new)
+    log("notified.")
     save_state(seen)
+    if fetch_errors:
+        raise RuntimeError(f"{fetch_errors} category fetches failed; catalog coverage may be incomplete")
 
 
 # --------------------------------------------------------------------------- #
@@ -382,12 +463,21 @@ def main() -> int:
         except Exception as exc:  # don't die if the first ping fails
             log(f"startup ping failed: {exc}")
 
+    last_health_alert = None
     while True:
         t0 = time.monotonic()
         try:
             sweep(session, seed=False, dry_run=args.dry_run)
         except Exception as exc:  # never let one bad sweep kill the worker
             log(f"sweep error (continuing): {exc!r}")
+            if (not args.dry_run and
+                    (last_health_alert is None or
+                     time.monotonic() - last_health_alert >= HEALTH_ALERT_SECONDS)):
+                try:
+                    _send(f"\u26a0\ufe0f Chrome Hearts product monitor needs attention: {exc}")
+                    last_health_alert = time.monotonic()
+                except Exception as alert_exc:
+                    log(f"health alert failed: {alert_exc!r}")
         elapsed = time.monotonic() - t0
         time.sleep(max(2.0, POLL_SECONDS - elapsed) + random.uniform(0, 4))
 

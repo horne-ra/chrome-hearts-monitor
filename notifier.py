@@ -19,6 +19,10 @@ from email.mime.text import MIMEText
 import requests
 
 
+def _http_error(service: str, resp: requests.Response) -> RuntimeError:
+    return RuntimeError(f"{service} returned HTTP {resp.status_code}: {resp.text[:200]!r}")
+
+
 def _env(name: str) -> str:
     val = os.environ.get(name)
     if not val:
@@ -38,26 +42,34 @@ def _send_discord(body: str, *, suppress_embeds: bool = False) -> None:
     payload = {"content": body[:2000]}
     if suppress_embeds:
         payload["flags"] = 1 << 2  # Discord SUPPRESS_EMBEDS
-    resp = requests.post(url, json=payload, timeout=30)
+    try:
+        resp = requests.post(url, json=payload, timeout=30)
+    except requests.RequestException as exc:
+        if isinstance(exc, requests.HTTPError) and exc.response is not None:
+            raise _http_error("Discord webhook", exc.response) from exc
+        raise RuntimeError("Discord webhook request failed") from exc
     if resp.status_code >= 300:
-        print(f"[discord] error {resp.status_code}: {resp.text}", file=sys.stderr)
-    else:
-        print("[discord] sent")
+        raise _http_error("Discord webhook", resp)
+    print("[discord] sent")
 
 
 def _send_twilio(body: str) -> None:
     sid = _env("TWILIO_ACCOUNT_SID")
     token = _env("TWILIO_AUTH_TOKEN")
-    resp = requests.post(
-        f"https://api.twilio.com/2010-04-01/Accounts/{sid}/Messages.json",
-        auth=(sid, token),
-        data={"From": _env("TWILIO_FROM"), "To": _env("TWILIO_TO"), "Body": body},
-        timeout=30,
-    )
+    try:
+        resp = requests.post(
+            f"https://api.twilio.com/2010-04-01/Accounts/{sid}/Messages.json",
+            auth=(sid, token),
+            data={"From": _env("TWILIO_FROM"), "To": _env("TWILIO_TO"), "Body": body},
+            timeout=30,
+        )
+    except requests.RequestException as exc:
+        if isinstance(exc, requests.HTTPError) and exc.response is not None:
+            raise _http_error("Twilio", exc.response) from exc
+        raise RuntimeError("Twilio request failed") from exc
     if resp.status_code >= 300:
-        print(f"[twilio] error {resp.status_code}: {resp.text}", file=sys.stderr)
-    else:
-        print("[twilio] sent")
+        raise _http_error("Twilio", resp)
+    print("[twilio] sent")
 
 
 def _send_email_sms(body: str) -> None:
