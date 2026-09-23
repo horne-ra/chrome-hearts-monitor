@@ -1,0 +1,138 @@
+import unittest
+import tempfile
+from pathlib import Path
+from unittest.mock import patch
+
+import chrome_hearts_monitor as monitor
+import notifier
+
+
+PRODUCT_HTML = '''
+<span class="product-metadata d-none" data-pid="190372BLKXXX01W"
+      data-name="BLACK SWEATPANTS" data-price="730.00"
+      data-category="HOODIE + SWEATPANTS"></span>
+'''
+PRODUCT_URL = ("https://www.chromehearts.com/black-sweatpants/190372BLKXXX01W.html"
+               "?dwvar_190372BLKXXX01W_size=XSM")
+
+
+class ProductDiscoveryTests(unittest.TestCase):
+    def test_search_show_category_link_is_discovered(self):
+        html = ('<a href="/on/demandware.store/Sites-ChromeHearts-Site/en_US/'
+                'Search-Show?cgid=SWEATPANTS">SWEATPANTS</a>')
+        self.assertIn(f"{monitor.CATEGORY_ENDPOINT}?cgid=SWEATPANTS",
+                      monitor.discover_category_paths(html))
+
+    def test_redirected_product_uses_its_real_url(self):
+        product = monitor.parse_products(PRODUCT_HTML, PRODUCT_URL)["190372BLKXXX01W"]
+        self.assertEqual(product.url, PRODUCT_URL)
+        self.assertEqual(product.price, "730.00")
+
+    def test_single_segment_product_link_is_recognized(self):
+        html = PRODUCT_HTML + '<a href="/black-sweatpants/190372BLKXXX01W.html">View</a>'
+        product = monitor.parse_products(html)["190372BLKXXX01W"]
+        self.assertEqual(product.url, PRODUCT_URL.split("?")[0])
+
+    def test_crawl_checks_sweatpants_category(self):
+        class Response:
+            status_code = 200
+            text = PRODUCT_HTML
+            url = PRODUCT_URL
+
+        with patch.object(monitor, "CATEGORIES", []), \
+             patch.object(monitor, "sitemap_category_paths", return_value=[]), \
+             patch.object(monitor, "fetch", side_effect=lambda _, url: Response()
+                          if "cgid=SWEATPANTS" in url else None), \
+             patch.object(monitor.time, "sleep"):
+            catalog, errors = monitor.crawl(object())
+        self.assertEqual(catalog["190372BLKXXX01W"].url, PRODUCT_URL)
+        self.assertEqual(errors, 1)
+
+    def test_sitemap_adds_categories_missing_from_static_list(self):
+        index = b'<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"><sitemap><loc>https://www.chromehearts.com/sitemap_0.xml</loc></sitemap></sitemapindex>'
+        catalog = b'<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"><url><loc>https://www.chromehearts.com/new-category</loc></url><url><loc>https://www.chromehearts.com/shop</loc></url></urlset>'
+
+        class Response:
+            def __init__(self, content):
+                self.content = content
+
+            def raise_for_status(self):
+                pass
+
+        class Session:
+            def get(self, url, timeout):
+                return Response(index if url.endswith('sitemap_index.xml') else catalog)
+
+        with patch.object(monitor, "_sitemap_checked_at", 0.0), \
+             patch.object(monitor, "_sitemap_paths", []):
+            self.assertEqual(monitor.sitemap_category_paths(Session()), ['/new-category'])
+
+    def test_dry_run_does_not_mark_product_seen(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / 'seen.json'
+            state.write_text('{"old": {}}')
+            product = monitor.parse_products(PRODUCT_HTML, PRODUCT_URL)
+            with patch.object(monitor, "STATE_FILE", state), \
+                 patch.object(monitor, "crawl", return_value=(product, 0)), \
+                 patch.object(monitor, "notify_new") as notify:
+                monitor.sweep(object(), seed=False, dry_run=True)
+            self.assertEqual(state.read_text(), '{"old": {}}')
+            notify.assert_not_called()
+
+    def test_missing_state_cannot_silently_seed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / 'missing.json'
+            product = monitor.parse_products(PRODUCT_HTML, PRODUCT_URL)
+            with patch.object(monitor, "STATE_FILE", state), \
+                 patch.object(monitor, "crawl", return_value=(product, 0)):
+                with self.assertRaises(FileNotFoundError):
+                    monitor.sweep(object(), seed=False, dry_run=False)
+            self.assertFalse(state.exists())
+
+    def test_empty_crawl_cannot_update_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / 'seen.json'
+            state.write_text('{"old": {}}')
+            with patch.object(monitor, "STATE_FILE", state), \
+                 patch.object(monitor, "crawl", return_value=({}, 0)):
+                with self.assertRaisesRegex(RuntimeError, 'no products'):
+                    monitor.sweep(object(), seed=False, dry_run=False)
+            self.assertEqual(state.read_text(), '{"old": {}}')
+
+    def test_failed_delivery_does_not_mark_product_seen(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / 'seen.json'
+            state.write_text('{"old": {}}')
+            product = monitor.parse_products(PRODUCT_HTML, PRODUCT_URL)
+            with patch.object(monitor, "STATE_FILE", state), \
+                 patch.object(monitor, "crawl", return_value=(product, 0)), \
+                 patch.object(monitor, "notify_new", side_effect=RuntimeError('delivery failed')):
+                with self.assertRaisesRegex(RuntimeError, 'delivery failed'):
+                    monitor.sweep(object(), seed=False, dry_run=False)
+            self.assertEqual(state.read_text(), '{"old": {}}')
+
+    def test_partial_fetch_reports_degraded_coverage(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / 'seen.json'
+            state.write_text('{"old": {}}')
+            product = monitor.parse_products(PRODUCT_HTML, PRODUCT_URL)
+            with patch.object(monitor, "STATE_FILE", state), \
+                 patch.object(monitor, "crawl", return_value=(product, 1)), \
+                 patch.object(monitor, "notify_new") as notify:
+                with self.assertRaisesRegex(RuntimeError, 'coverage may be incomplete'):
+                    monitor.sweep(object(), seed=False, dry_run=False)
+            notify.assert_called_once()
+            self.assertIn('190372BLKXXX01W', state.read_text())
+
+    def test_discord_http_error_is_a_delivery_failure(self):
+        class Response:
+            status_code = 429
+
+        with patch.dict(notifier.os.environ, {'DISCORD_WEBHOOK_URL': 'https://example.test/webhook'}), \
+             patch.object(notifier.requests, 'post', return_value=Response()):
+            with self.assertRaisesRegex(RuntimeError, 'HTTP 429'):
+                notifier._send_discord('test')
+
+
+if __name__ == "__main__":
+    unittest.main()

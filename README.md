@@ -31,6 +31,10 @@ just contribute nothing.
 The worker runs forever. Each ~30s sweep:
 1. Fetches the homepage + every category in `CATEGORIES` as a gentle, jittered
    trickle of requests (reads like browsing, not a burst — keeps Cloudflare calm).
+   It also checks `CATEGORY_IDS` through the storefront's `Search-Show` endpoint;
+   a category with one item may redirect straight to that product page. It
+   refreshes the official sitemap every ten minutes for new category slugs and
+   follows category links found in fetched HTML on every sweep.
 2. Builds the live product set, keyed by product id (PID).
 3. Diffs against persistent history; only PIDs never seen before are "new."
 4. Infers size from the PID/link when Chrome Hearts encodes one in the SKU.
@@ -39,9 +43,16 @@ The worker runs forever. Each ~30s sweep:
 Keying on PID means it catches genuinely new items even inside categories that
 already had products. Seen PIDs remain in history when products sell out or a
 category temporarily fails to load, so ordinary restocks and transient crawl
-gaps do not generate false "new" alerts. The first sweep with no prior snapshot
-**seeds silently** (records the catalog, sends nothing), so you never get flooded
-on boot.
+gaps do not generate false "new" alerts. The initial snapshot must be created
+explicitly with `--seed`. A missing or unreadable state file raises a monitor
+health warning instead of silently treating a new release as already seen. A
+sweep finding zero products also refuses to update state. `--dry-run` does not
+record newly found products as seen. Fetch failures in individual categories
+produce a throttled health warning while successfully found products are still
+processed; seeding is blocked until all category fetches succeed.
+
+Notification HTTP errors fail the sweep without saving the new PIDs, so the next
+sweep retries them. If a batch partly succeeded, the retry may repeat a message.
 
 Small drops are sent as one message per product. Large batches are split into
 numbered Discord messages containing every item, up to `CH_MAX_INDIVIDUAL` items
@@ -60,8 +71,10 @@ of link-preview cards while keeping every product directly clickable.
    - `DISCORD_WEBHOOK_URL = <your webhook>`
    - `CH_STATE_FILE = /data/seen_products.json`
 4. **Volume** (so state survives restarts — important): add a Volume to the
-   service mounted at `/data`. Without it a redeploy wipes the snapshot and the
-   monitor re-seeds (harmless, but you lose history; with it, nothing is lost).
+   service mounted at `/data`. Before starting the normal loop, initialize
+   `/data/seen_products.json` with an explicit `--seed` run after checking the
+   current catalog. A missing volume or state file now triggers a health warning
+   instead of silently reseeding.
 5. Deploy. You should get a "monitor online" Discord ping within a minute, then
    alerts as drops land.
 
@@ -208,8 +221,13 @@ own online ping.
 `CATEGORIES` in `chrome_hearts_monitor.py` is the full known slug list — the few
 that are usually live plus ~28 valid-but-usually-empty ones that populate when a
 drop lands. Each sweep also discovers same-site top-level category links from
-the homepage/category HTML and crawls a small capped number of those dynamically,
+the homepage/category HTML and crawls those dynamically,
 so a newly linked slug can be checked before it is manually added to the list.
+`CATEGORY_IDS` covers menu categories that use Salesforce's `Search-Show?cgid=`
+route instead of a top-level slug. The `SWEATPANTS` category uses this route and
+currently redirects to the `BLACK SWEATPANTS` product page.
+The official sitemap is a second source for top-level categories; it currently
+omits `SWEATPANTS`, so the menu link and explicit category ID remain needed.
 
 **Known gap:** fine jewelry (rings/necklaces/bracelets) has no working top-level
 slug observed live; `/ring`, `/jewelry`, etc. 404. The homepage sweep plus
