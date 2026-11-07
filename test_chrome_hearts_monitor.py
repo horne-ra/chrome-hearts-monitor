@@ -229,6 +229,21 @@ class FetchDiagnosticsTests(unittest.TestCase):
             self.assertNotIn("secret", str(log.call_args_list))
             self.assertEqual(notify.call_args.args[0][0].url, url)
 
+    def test_partial_dry_run_keeps_cooldown_without_writing_product_history(self):
+        products = monitor.parse_products(PRODUCT_HTML, PRODUCT_URL)
+        for previous in ('{"old": {}}', json.dumps({pid: {} for pid in products})):
+            with self.subTest(previous=previous), tempfile.TemporaryDirectory() as directory:
+                state = Path(directory) / "seen.json"
+                state.write_text(previous)
+                with patch.object(monitor, "STATE_FILE", state), \
+                     patch.object(monitor, "crawl", return_value=monitor.CrawlResult(products, 1, "HTTP 429", 900)), \
+                     patch.object(monitor, "notify_new") as notify:
+                    with self.assertRaises(monitor.MonitorFailure) as caught:
+                        monitor.sweep(object(), seed=False, dry_run=True)
+                self.assertEqual(caught.exception.retry_after, 900)
+                self.assertEqual(state.read_text(), previous)
+                notify.assert_not_called()
+
     def test_rate_limit_stops_requests_and_preserves_retry_after(self):
         session = monitor.requests.Session()
         with patch.object(session, "get", return_value=response(429, headers={"Retry-After": "120"})) as get, \
@@ -428,6 +443,20 @@ class HealthIncidentTests(unittest.TestCase):
                 monitor.main()
         wait.assert_called_once_with(1600)
         sweep.assert_called_once()
+        send.assert_not_called()
+
+    def test_dry_run_loop_honors_saved_cooldown_without_updating_it(self):
+        monitor.write_json(self.path, {"failures": 3, "alerted": True, "next_sweep_at": 1600})
+        before = self.path.read_bytes()
+        with patch.object(sys, "argv", ["monitor", "--loop", "--dry-run"]), \
+             patch.object(monitor, "wait_until") as wait, \
+             patch.object(monitor, "sweep", side_effect=RuntimeError("still down")), \
+             patch.object(monitor.time, "sleep", side_effect=StopIteration), \
+             patch.object(monitor, "_send") as send:
+            with self.assertRaises(StopIteration):
+                monitor.main()
+        wait.assert_called_once_with(1600)
+        self.assertEqual(self.path.read_bytes(), before)
         send.assert_not_called()
 
     def test_invalid_health_file_does_not_stop_monitor(self):

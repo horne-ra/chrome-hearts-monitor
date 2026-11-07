@@ -493,9 +493,9 @@ class HealthMonitor:
     """Track consecutive failures and deliver one warning per incident."""
 
     def __init__(self, *, dry_run: bool):
-        """Use isolated in-memory tracking for diagnostic dry runs."""
+        """Load cooldowns in every loop mode; dry runs never persist changes."""
         self.dry_run = dry_run
-        self.state = HealthState() if dry_run else load_health()
+        self.state = load_health()
 
     def persist(self) -> None:
         """Save incident status while allowing recovery from volume write failures."""
@@ -658,9 +658,9 @@ def process_crawl(result: CrawlResult, *, seed: bool, dry_run: bool) -> None:
         log(f"{len(catalog)} live, 0 new.")
         if not dry_run:
             save_state(seen)
-            if fetch_errors:
-                raise MonitorFailure("catalog coverage may be incomplete. " + result.summary,
-                                     retry_after=result.retry_after)
+        if fetch_errors:
+            raise MonitorFailure("catalog coverage may be incomplete. " + result.summary,
+                                 retry_after=result.retry_after)
         return
 
     log(f"{len(catalog)} live, {len(new)} NEW:")
@@ -669,10 +669,10 @@ def process_crawl(result: CrawlResult, *, seed: bool, dry_run: bool) -> None:
         log("   + " + logged.pretty().replace("\n", " | "))
     if dry_run:
         log("[dry-run] not sending.")
-        return
-    notify_new(new)
-    log("notified.")
-    save_state(seen)
+    else:
+        notify_new(new)
+        log("notified.")
+        save_state(seen)
     if fetch_errors:
         raise MonitorFailure("catalog coverage may be incomplete. " + result.summary,
                              retry_after=result.retry_after)
