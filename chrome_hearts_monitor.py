@@ -226,10 +226,11 @@ def check_response(response: requests.Response, url: str) -> str:
               f"final={diagnostic_url(response.url)} "
               f"type={response.headers.get('Content-Type', 'unknown')} "
               f"bytes={len(response.content)} challenge={challenge}")
-    if response.status_code in (403, 429) or challenge:
+    retry_after = retry_after_seconds(response.headers.get("Retry-After", ""))
+    if (response.status_code in (403, 429) or challenge or
+            (response.status_code >= 500 and retry_after > 0)):
         log(f"  ! crawl paused: {detail}")
-        raise FetchPaused(detail, retry_after=retry_after_seconds(
-            response.headers.get("Retry-After", "")))
+        raise FetchPaused(detail, retry_after=retry_after)
     return detail
 
 
@@ -246,8 +247,6 @@ def fetch(session: requests.Session, url: str) -> requests.Response | None:
                 return None
             delay = max(1.5 * 2 ** (attempt - 1), retry_after_seconds(
                 r.headers.get("Retry-After", "")))
-            if delay > 10:
-                raise FetchPaused(detail, retry_after=delay)
         except requests.RequestException as exc:
             log(f"  ! {diagnostic_url(url)} attempt {attempt}/{MAX_RETRIES}: "
                 f"{type(exc).__name__}")
@@ -363,6 +362,9 @@ def sitemap_category_paths(session: requests.Session) -> list[str]:
                     paths.append(path)
         _sitemap_paths = paths
         return paths
+    except FetchPaused:
+        _sitemap_checked_at = 0.0
+        raise
     except (requests.RequestException, ET.ParseError, DefusedXmlException) as exc:
         log(f"sitemap refresh failed: {exc}")
         return _sitemap_paths
@@ -446,6 +448,7 @@ def load_state() -> dict[str, dict]:
 
 
 def save_state(catalog: dict[str, Product | dict]) -> None:
+    """Persist accumulated product history without dropping previously seen IDs."""
     serialized = {
         pid: asdict(product) if isinstance(product, Product) else product
         for pid, product in catalog.items()
@@ -683,6 +686,7 @@ def process_crawl(result: CrawlResult, *, seed: bool, dry_run: bool) -> None:
 # --------------------------------------------------------------------------- #
 
 def main() -> int:
+    """Run the selected monitor mode and recover from failures in loop mode."""
     ap = argparse.ArgumentParser(description="Chrome Hearts new-product monitor")
     ap.add_argument("--loop", action="store_true", help="run forever (Railway)")
     ap.add_argument("--once", action="store_true", help="one sweep then exit")
