@@ -48,8 +48,35 @@ explicitly with `--seed`. A missing or unreadable state file raises a monitor
 health warning instead of silently treating a new release as already seen. A
 sweep finding zero products also refuses to update state. `--dry-run` does not
 record newly found products as seen. Fetch failures in individual categories
-produce a throttled health warning while successfully found products are still
+produce a health warning while successfully found products are still
 processed; seeding is blocked until all category fetches succeed.
+
+Health warnings are sent after three consecutive failed sweeps by default, once
+per incident. A separate `seen_products.health.json` file next to the product
+history stores the failure count, notification status, and retry deadline, so
+restarts on the same persistent volume do not repeat an already delivered
+warning. A successful sweep clears the failure count and sends one recovery
+message if a warning was delivered. Failed warning/recovery deliveries are
+retried with at least a minute between attempts. Startup pings are suppressed
+while an incident is active. Product history is never reset by health tracking.
+
+Failed sweeps back off from 60 to 120 to 240 seconds, then up to five minutes
+with the default settings. The next successful sweep restores the normal poll
+interval. HTTP 403, HTTP 429, and detected challenge pages stop that crawl early;
+three consecutive exhausted page fetches also stop a crawl during a network
+outage. Valid products collected before a crawl is stopped are still processed.
+Server `Retry-After` values (seconds or HTTP dates) are honored up to one hour,
+including across `--loop` restarts. Loop runs, including `--loop --dry-run`, wait
+for saved retry deadlines. Explicit `--once` and `--seed` diagnostic runs do not
+load those deadlines. There is no attempt to bypass access challenges.
+
+Logs include a per-crawl HTTP status summary. Failed HTTP requests include the
+requested path, final URL, status, content type, response size, and challenge
+detection. Empty crawls include sample empty-page redirects to distinguish
+normal homepage redirects from unexpected responses. URL query tokens and page
+bodies are not logged. For an outage, inspect these deployment logs before
+changing hosting or resetting state. A provider incident may explain failures,
+but does not by itself establish the cause of an individual crawl failure.
 
 Notification HTTP errors fail the sweep without saving the new PIDs, so the next
 sweep retries them. If a batch partly succeeded, the retry may repeat a message.
@@ -75,6 +102,8 @@ of link-preview cards while keeping every product directly clickable.
    `/data/seen_products.json` with an explicit `--seed` run after checking the
    current catalog. A missing volume or state file now triggers a health warning
    instead of silently reseeding.
+   Health tracking automatically uses `/data/seen_products.health.json` when
+   the product state is `/data/seen_products.json`; no new variable is required.
 5. Deploy. You should get a "monitor online" Discord ping within a minute, then
    alerts as drops land.
 
@@ -171,6 +200,9 @@ python ww_slots_monitor.py --loop                  # appointment Railway service
 | `CH_MAX_INDIVIDUAL` | `8` | maximum items per message in a paginated large batch |
 | `CH_STARTUP_PING` | `1` | send a "monitor online" Discord ping on boot |
 | `CH_STATE_FILE` | `seen_products.json` | snapshot path (set to `/data/...` on Railway) |
+| `CH_HEALTH_FILE` | product state path with `.health.json` suffix | persistent incident tracker; keep on the same volume |
+| `CH_HEALTH_FAILURE_THRESHOLD` | `3` | consecutive failed sweeps before an incident warning |
+| `CH_BACKOFF_MAX_SECONDS` | `300` | maximum exponential sweep delay; a longer server `Retry-After` takes precedence, capped at one hour |
 
 Appointment monitor:
 
