@@ -31,15 +31,18 @@ def _env(name: str) -> str:
     return val
 
 
-def _send_discord(body: str, *, suppress_embeds: bool = False) -> None:
+def _send_discord(body: str, *, suppress_embeds: bool = False,
+                  webhook_url: str | None = None) -> None:
     """
     POST to a Discord channel webhook. To get the URL:
       Discord -> Server Settings -> Integrations -> Webhooks -> New Webhook
       -> pick a channel -> Copy Webhook URL.
     The URL itself is the secret; anyone with it can post to that channel.
     """
-    url = _env("DISCORD_WEBHOOK_URL")
+    url = webhook_url if webhook_url is not None else _env("DISCORD_WEBHOOK_URL")
     payload = {"content": body[:2000]}
+    if webhook_url is not None:
+        payload["allowed_mentions"] = {"parse": []}
     if suppress_embeds:
         payload["flags"] = 1 << 2  # Discord SUPPRESS_EMBEDS
     try:
@@ -51,6 +54,15 @@ def _send_discord(body: str, *, suppress_embeds: bool = False) -> None:
     if resp.status_code >= 300:
         raise _http_error("Discord webhook", resp)
     print("[discord] sent")
+
+
+def send_monitor_notification(body: str) -> None:
+    """Send operational notices only to the dedicated monitor-issues webhook."""
+    url = os.environ.get("DISCORD_MONITOR_WEBHOOK_URL", "").strip()
+    if not url:
+        raise RuntimeError("DISCORD_MONITOR_WEBHOOK_URL is not configured; "
+                           "monitor notice was not sent")
+    _send_discord(body, suppress_embeds=True, webhook_url=url)
 
 
 def _send_twilio(body: str) -> None:

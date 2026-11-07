@@ -399,6 +399,52 @@ class FetchDiagnosticsTests(unittest.TestCase):
             self.assertIn("190372BLKXXX01W", json.loads(state.read_text()))
 
 
+class NotificationRoutingTests(unittest.TestCase):
+    def test_monitor_notices_use_only_the_private_webhook(self):
+        """Send operational messages to the dedicated route regardless of drop backend."""
+        env = {"DISCORD_WEBHOOK_URL": "https://example.test/drops",
+               "DISCORD_MONITOR_WEBHOOK_URL": "https://example.test/issues",
+               "NOTIFY_METHOD": "twilio"}
+        with patch.dict(notifier.os.environ, env, clear=True), \
+             patch.object(notifier.requests, "post", return_value=response(204)) as post:
+            monitor._send_health("monitor issue")
+        self.assertEqual(post.call_args.args[0], env["DISCORD_MONITOR_WEBHOOK_URL"])
+        self.assertEqual(post.call_args.kwargs["json"]["allowed_mentions"], {"parse": []})
+        self.assertEqual(post.call_args.kwargs["json"]["flags"], 1 << 2)
+
+    def test_missing_monitor_webhook_never_falls_back_to_group(self):
+        """Keep configuration mistakes from exposing operational notices to the group."""
+        env = {"DISCORD_WEBHOOK_URL": "https://example.test/drops"}
+        with patch.dict(notifier.os.environ, env, clear=True), \
+             patch.object(notifier.requests, "post") as post:
+            with self.assertRaisesRegex(RuntimeError, "DISCORD_MONITOR_WEBHOOK_URL"):
+                monitor._send_health("monitor issue")
+        post.assert_not_called()
+
+    def test_failed_monitor_webhook_never_falls_back_to_group(self):
+        """Retry delivery through health tracking without attempting the drop destination."""
+        env = {"DISCORD_WEBHOOK_URL": "https://example.test/drops",
+               "DISCORD_MONITOR_WEBHOOK_URL": "https://example.test/issues"}
+        with patch.dict(notifier.os.environ, env, clear=True), \
+             patch.object(notifier.requests, "post", return_value=response(500)) as post:
+            with self.assertRaisesRegex(RuntimeError, "HTTP 500"):
+                monitor._send_health("monitor issue")
+        post.assert_called_once()
+        self.assertEqual(post.call_args.args[0], env["DISCORD_MONITOR_WEBHOOK_URL"])
+
+    def test_product_drop_still_uses_existing_group_webhook(self):
+        """Keep normal product alerts on the previously configured destination."""
+        env = {"DISCORD_WEBHOOK_URL": "https://example.test/drops",
+               "DISCORD_MONITOR_WEBHOOK_URL": "https://example.test/issues"}
+        product = monitor.parse_products(PRODUCT_HTML, PRODUCT_URL)["190372BLKXXX01W"]
+        with patch.dict(notifier.os.environ, env, clear=True), \
+             patch.object(notifier.requests, "post", return_value=response(204)) as post, \
+             patch.object(monitor.time, "sleep"):
+            monitor.notify_new([product])
+        post.assert_called_once()
+        self.assertEqual(post.call_args.args[0], env["DISCORD_WEBHOOK_URL"])
+
+
 class HealthIncidentTests(unittest.TestCase):
     def setUp(self):
         """Isolate persisted health state and retry settings for each test."""
@@ -415,7 +461,7 @@ class HealthIncidentTests(unittest.TestCase):
     def test_transient_failures_clear_silently(self):
         """Verify transient failures clear silently."""
         health = monitor.HealthMonitor(dry_run=False)
-        with patch.object(monitor, "_send") as send:
+        with patch.object(monitor, "_send_health") as send:
             health.failure(RuntimeError("temporary"))
             health.failure(RuntimeError("temporary"))
             health.success()
@@ -426,7 +472,7 @@ class HealthIncidentTests(unittest.TestCase):
         """Verify one warning survives restarts and new incident alerts after recovery."""
         health = monitor.HealthMonitor(dry_run=False)
         with patch.object(monitor.time, "time", return_value=1000), \
-             patch.object(monitor, "_send") as send:
+             patch.object(monitor, "_send_health") as send:
             for _ in range(3):
                 health.failure(RuntimeError("empty crawl"))
             self.assertEqual(send.call_count, 1)
@@ -434,7 +480,7 @@ class HealthIncidentTests(unittest.TestCase):
             health.failure(RuntimeError("still empty"))
             self.assertEqual(send.call_count, 1)
         with patch.object(monitor.time, "time", return_value=1200), \
-             patch.object(monitor, "_send") as send:
+             patch.object(monitor, "_send_health") as send:
             health.success()
             self.assertIn("recovered", send.call_args.args[0])
             health.success()
@@ -447,7 +493,7 @@ class HealthIncidentTests(unittest.TestCase):
         """Verify backoff and server cooldown survive restart."""
         health = monitor.HealthMonitor(dry_run=False)
         with patch.object(monitor.time, "time", return_value=1000), \
-             patch.object(monitor, "_send"):
+             patch.object(monitor, "_send_health"):
             expected_delays = [60, 120, 240, 300, 300]
             for delay in expected_delays:
                 health.failure(RuntimeError("network failure"))
@@ -459,14 +505,14 @@ class HealthIncidentTests(unittest.TestCase):
         """Verify failed warning retries then stays suppressed."""
         health = monitor.HealthMonitor(dry_run=False)
         with patch.object(monitor.time, "time", return_value=1000), \
-             patch.object(monitor, "_send", side_effect=RuntimeError("Discord unavailable")) as send:
+             patch.object(monitor, "_send_health", side_effect=RuntimeError("Discord unavailable")) as send:
             for _ in range(4):
                 health.failure(RuntimeError("empty crawl"))
             send.assert_called_once()
         self.assertFalse(monitor.load_health().alerted)
         health = monitor.HealthMonitor(dry_run=False)
         with patch.object(monitor.time, "time", return_value=1100), \
-             patch.object(monitor, "_send") as send:
+             patch.object(monitor, "_send_health") as send:
             health.failure(RuntimeError("empty crawl"))
             health.failure(RuntimeError("empty crawl"))
             send.assert_called_once()
@@ -477,11 +523,11 @@ class HealthIncidentTests(unittest.TestCase):
         health = monitor.HealthMonitor(dry_run=False)
         health.state = monitor.HealthState(failures=3, alerted=True)
         with patch.object(monitor.time, "time", return_value=1000), \
-             patch.object(monitor, "_send", side_effect=RuntimeError("offline")):
+             patch.object(monitor, "_send_health", side_effect=RuntimeError("offline")):
             health.success()
         health = monitor.HealthMonitor(dry_run=False)
         with patch.object(monitor.time, "time", return_value=1100), \
-             patch.object(monitor, "_send") as send:
+             patch.object(monitor, "_send_health") as send:
             health.success()
             health.success()
             send.assert_called_once()
@@ -493,7 +539,7 @@ class HealthIncidentTests(unittest.TestCase):
         self.path.write_text('{"failures": 9, "alerted": true}')
         before = self.path.read_bytes()
         health = monitor.HealthMonitor(dry_run=True)
-        with patch.object(monitor, "_send") as send:
+        with patch.object(monitor, "_send_health") as send:
             for _ in range(4):
                 health.failure(RuntimeError("empty crawl"))
             health.success()
@@ -508,12 +554,26 @@ class HealthIncidentTests(unittest.TestCase):
              patch.object(monitor, "wait_until") as wait, \
              patch.object(monitor, "sweep", side_effect=RuntimeError("still down")) as sweep, \
              patch.object(monitor.time, "sleep", side_effect=StopIteration), \
-             patch.object(monitor, "_send") as send:
+             patch.object(monitor, "_send_health") as send:
             with self.assertRaises(StopIteration):
                 monitor.main()
         wait.assert_called_once_with(1600)
         sweep.assert_called_once()
         send.assert_not_called()
+
+    def test_startup_notice_uses_health_route_only(self):
+        """Send healthy startup notices privately while preserving product routing."""
+        with patch.object(sys, "argv", ["monitor", "--loop"]), \
+             patch.object(monitor, "STARTUP_PING", True), \
+             patch.object(monitor, "sweep"), \
+             patch.object(monitor.time, "sleep", side_effect=StopIteration), \
+             patch.object(monitor, "_send_health") as health_send, \
+             patch.object(monitor, "_send") as product_send:
+            with self.assertRaises(StopIteration):
+                monitor.main()
+        health_send.assert_called_once()
+        self.assertIn("monitor online", health_send.call_args.args[0])
+        product_send.assert_not_called()
 
     def test_dry_run_loop_honors_saved_cooldown_without_updating_it(self):
         """Verify dry run loop honors saved cooldown without updating it."""
@@ -523,7 +583,7 @@ class HealthIncidentTests(unittest.TestCase):
              patch.object(monitor, "wait_until") as wait, \
              patch.object(monitor, "sweep", side_effect=RuntimeError("still down")), \
              patch.object(monitor.time, "sleep", side_effect=StopIteration), \
-             patch.object(monitor, "_send") as send:
+             patch.object(monitor, "_send_health") as send:
             with self.assertRaises(StopIteration):
                 monitor.main()
         wait.assert_called_once_with(1600)
@@ -538,7 +598,7 @@ class HealthIncidentTests(unittest.TestCase):
     def test_unwritable_health_file_does_not_stop_monitor(self):
         """Verify unwritable health file does not stop monitor."""
         with patch.object(monitor, "write_json", side_effect=PermissionError), \
-             patch.object(monitor, "_send"):
+             patch.object(monitor, "_send_health"):
             health = monitor.HealthMonitor(dry_run=False)
             for _ in range(3):
                 health.failure(RuntimeError("crawl failed"))
