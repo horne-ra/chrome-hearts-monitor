@@ -60,6 +60,16 @@ message if a warning was delivered. Failed warning/recovery deliveries are
 retried with at least a minute between attempts. Startup pings are suppressed
 while an incident is active. Product history is never reset by health tracking.
 
+Product-monitor warnings, recovery messages, and startup notices go exclusively
+to `DISCORD_MONITOR_WEBHOOK_URL`. Product drops continue to use the existing
+`DISCORD_WEBHOOK_URL` and `NOTIFY_METHOD` configuration. Set the monitor webhook
+as a secret variable on the product worker in Railway, pointing to your private
+issues channel. Operational notices disable Discord mentions and link previews.
+If this webhook is missing or delivery fails, the worker logs the error and
+retries incident/recovery notices; it never falls back to the group drop channel.
+Existing incident deduplication and product history remain intact when changing
+the destination. Appointment-slot notifications keep their current routing.
+
 Failed sweeps back off from 60 to 120 to 240 seconds, then up to five minutes
 with the default settings. The next successful sweep restores the normal poll
 interval. HTTP 403, HTTP 429, and detected challenge pages stop that crawl early;
@@ -96,6 +106,7 @@ of link-preview cards while keeping every product directly clickable.
 3. **Variables** (Settings -> Variables): add
    - `NOTIFY_METHOD = discord`
    - `DISCORD_WEBHOOK_URL = <your webhook>`
+   - `DISCORD_MONITOR_WEBHOOK_URL = <your private monitor-issues webhook>`
    - `CH_STATE_FILE = /data/seen_products.json`
 4. **Volume** (so state survives restarts — important): add a Volume to the
    service mounted at `/data`. Before starting the normal loop, initialize
@@ -199,6 +210,7 @@ python ww_slots_monitor.py --loop                  # appointment Railway service
 | `CH_POLL_SECONDS` | `30` | target seconds between sweep starts |
 | `CH_MAX_INDIVIDUAL` | `8` | maximum items per message in a paginated large batch |
 | `CH_STARTUP_PING` | `1` | send a "monitor online" Discord ping on boot |
+| `DISCORD_MONITOR_WEBHOOK_URL` | unset | private destination for product-monitor warnings, recovery messages, and startup notices; no fallback to the drop webhook |
 | `CH_STATE_FILE` | `seen_products.json` | snapshot path (set to `/data/...` on Railway) |
 | `CH_HEALTH_FILE` | product state path with `.health.json` suffix | persistent incident tracker; keep on the same volume |
 | `CH_HEALTH_FAILURE_THRESHOLD` | `3` | consecutive failed sweeps before an incident warning |

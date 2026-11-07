@@ -526,7 +526,7 @@ class HealthMonitor:
         self.state.next_notification_at = time.time() + NOTIFICATION_RETRY_SECONDS
         self.persist()
         try:
-            _send("\u26a0\ufe0f Chrome Hearts product monitor needs attention "
+            _send_health("\u26a0\ufe0f Chrome Hearts product monitor needs attention "
                   f"after {self.state.failures} consecutive failed sweeps: "
                   f"{self.state.last_error}\n"
                   "Retrying with backoff. Further warnings are suppressed until recovery.")
@@ -549,7 +549,7 @@ class HealthMonitor:
             self.state.next_notification_at = time.time() + NOTIFICATION_RETRY_SECONDS
             self.persist()
             try:
-                _send("\U0001f7e2 Chrome Hearts product monitor recovered — "
+                _send_health("\U0001f7e2 Chrome Hearts product monitor recovered — "
                       "products are being detected again and the sweep completed successfully.")
             except Exception as exc:
                 log(f"recovery notification failed: {exc!r}")
@@ -572,6 +572,12 @@ def wait_until(deadline: float) -> None:
 def _send(body: str, *, suppress_embeds: bool = False) -> None:
     from notifier import send_notification
     send_notification(body, suppress_embeds=suppress_embeds)
+
+
+def _send_health(body: str) -> None:
+    """Keep issue warnings, recovery notices, and startup pings out of drop channels."""
+    from notifier import send_monitor_notification
+    send_monitor_notification(body)
 
 
 def build_batch_messages(products: list[Product]) -> list[str]:
@@ -713,7 +719,7 @@ def main() -> int:
         f"~{POLL_SECONDS}s sweeps. state={STATE_FILE}")
     if STARTUP_PING and not args.dry_run and not (health.state.failures or health.state.alerted):
         try:
-            _send(f"\U0001f7e2 Chrome Hearts monitor online — watching "
+            _send_health(f"\U0001f7e2 Chrome Hearts monitor online — watching "
                   f"{len(CATEGORIES)} base categories + discovered links, "
                   f"~{POLL_SECONDS}s sweeps.")
         except Exception as exc:  # don't die if the first ping fails
