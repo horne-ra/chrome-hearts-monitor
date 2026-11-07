@@ -64,31 +64,19 @@ class ProductDiscoveryTests(unittest.TestCase):
         index = b'<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"><sitemap><loc>https://www.chromehearts.com/sitemap_0.xml</loc></sitemap></sitemapindex>'
         catalog = b'<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"><url><loc>https://www.chromehearts.com/new-category</loc></url><url><loc>https://www.chromehearts.com/shop</loc></url></urlset>'
 
-        class Response:
-            def __init__(self, content):
-                self.content = content
-
-            def raise_for_status(self):
-                pass
-
         class Session:
             def get(self, url, timeout):
-                return Response(index if url.endswith('sitemap_index.xml') else catalog)
+                content = index if url.endswith('sitemap_index.xml') else catalog
+                return response(html=content.decode(), url=url)
 
         with patch.object(monitor, "_sitemap_checked_at", 0.0), \
              patch.object(monitor, "_sitemap_paths", []):
             self.assertEqual(monitor.sitemap_category_paths(Session()), ['/new-category'])
 
     def test_sitemap_rejects_entity_declarations(self):
-        class Response:
-            content = b'<!DOCTYPE x [<!ENTITY x "bad">]><sitemapindex><loc>&x;</loc></sitemapindex>'
-
-            def raise_for_status(self):
-                pass
-
         class Session:
             def get(self, url, timeout):
-                return Response()
+                return response(html='<!DOCTYPE x [<!ENTITY x "bad">]><sitemapindex><loc>&x;</loc></sitemapindex>', url=url)
 
         with patch.object(monitor, "_sitemap_checked_at", 0.0), \
              patch.object(monitor, "_sitemap_paths", ['/known']):
@@ -187,6 +175,60 @@ class ProductDiscoveryTests(unittest.TestCase):
                 notifier._send_discord('test')
 
 class FetchDiagnosticsTests(unittest.TestCase):
+    def test_sitemap_block_stops_before_category_requests(self):
+        session = monitor.requests.Session()
+        with patch.object(monitor, "_sitemap_checked_at", 0.0), \
+             patch.object(session, "get", return_value=response(403)) as get:
+            result = monitor.crawl(session)
+        get.assert_called_once_with(monitor.SITEMAP_INDEX, timeout=10)
+        self.assertEqual(result.catalog, {})
+        self.assertIn("sitemap refresh blocked", result.summary)
+
+    def test_child_sitemap_rate_limit_preserves_cooldown(self):
+        index = '<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"><sitemap><loc>https://www.chromehearts.com/sitemap_0.xml</loc></sitemap></sitemapindex>'
+        session = monitor.requests.Session()
+        with patch.object(monitor, "_sitemap_checked_at", 0.0), \
+             patch.object(session, "get", side_effect=[response(html=index), response(429, headers={"Retry-After": "900"})]) as get:
+            result = monitor.crawl(session)
+        self.assertEqual(get.call_count, 2)
+        self.assertEqual(result.retry_after, 900)
+
+    def test_other_sitemap_http_failures_keep_cached_categories(self):
+        session = monitor.requests.Session()
+        with patch.object(monitor, "_sitemap_checked_at", 0.0), \
+             patch.object(monitor, "_sitemap_paths", ["/known"]), \
+             patch.object(session, "get", return_value=response(503)):
+            self.assertEqual(monitor.sitemap_category_paths(session), ["/known"])
+
+    def test_post_crawl_errors_keep_server_cooldown(self):
+        products = monitor.parse_products(PRODUCT_HTML, PRODUCT_URL)
+        for target in ("load_state", "save_state", "notify_new"):
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as directory:
+                state = Path(directory) / "seen.json"
+                state.write_text('{"old": {}}')
+                with patch.object(monitor, "STATE_FILE", state), \
+                     patch.object(monitor, "crawl", return_value=monitor.CrawlResult(products, 1, "HTTP 429", 900)), \
+                     patch.object(monitor, "notify_new"), \
+                     patch.object(monitor, target, side_effect=RuntimeError("later failure")):
+                    with self.assertRaises(monitor.MonitorFailure) as caught:
+                        monitor.sweep(object(), seed=False, dry_run=False)
+                self.assertEqual(caught.exception.retry_after, 900)
+                self.assertIsInstance(caught.exception.__cause__, RuntimeError)
+
+    def test_product_logs_strip_queries_without_changing_notification_urls(self):
+        url = PRODUCT_URL + "&token=secret"
+        products = monitor.parse_products(PRODUCT_HTML, url)
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "seen.json"
+            state.write_text('{"old": {}}')
+            with patch.object(monitor, "STATE_FILE", state), \
+                 patch.object(monitor, "crawl", return_value=monitor.CrawlResult(products, 0)), \
+                 patch.object(monitor, "log") as log, \
+                 patch.object(monitor, "notify_new") as notify:
+                monitor.sweep(object(), seed=False, dry_run=False)
+            self.assertNotIn("secret", str(log.call_args_list))
+            self.assertEqual(notify.call_args.args[0][0].url, url)
+
     def test_rate_limit_stops_requests_and_preserves_retry_after(self):
         session = monitor.requests.Session()
         with patch.object(session, "get", return_value=response(429, headers={"Retry-After": "120"})) as get, \

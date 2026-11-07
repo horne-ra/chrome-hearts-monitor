@@ -38,7 +38,7 @@ import re
 import sys
 import time
 from collections import Counter
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, replace
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -162,7 +162,10 @@ def log(msg: str) -> None:
 
 
 class MonitorFailure(RuntimeError):
+    """A failed sweep with an optional server-requested cooldown."""
+
     def __init__(self, message: str, *, retry_after: float = 0):
+        """Keep the cooldown available to the loop's incident tracker."""
         super().__init__(message)
         self.retry_after = retry_after
 
@@ -173,6 +176,7 @@ class FetchPaused(MonitorFailure):
 
 @dataclass
 class CrawlResult:
+    """Products and coverage diagnostics, including any server cooldown."""
     catalog: dict[str, Product]
     errors: int
     summary: str = ""
@@ -190,6 +194,7 @@ def diagnostic_url(url: str) -> str:
 
 
 def retry_after_seconds(value: str) -> float:
+    """Parse Retry-After seconds or HTTP dates, bounded to one hour."""
     try:
         seconds = float(value)
     except ValueError:
@@ -202,6 +207,7 @@ def retry_after_seconds(value: str) -> float:
 
 
 def is_challenge(response: requests.Response) -> bool:
+    """Recognize access challenges without mistaking ordinary reCAPTCHA assets."""
     if response.headers.get("cf-mitigated", "").lower() == "challenge":
         return True
     html = response.text.lower()
@@ -213,19 +219,26 @@ def is_challenge(response: requests.Response) -> bool:
     ))
 
 
+def check_response(response: requests.Response, url: str) -> str:
+    """Describe a response and stop requests on blocking or rate limits."""
+    challenge = is_challenge(response)
+    detail = (f"{diagnostic_url(url)} -> HTTP {response.status_code} "
+              f"final={diagnostic_url(response.url)} "
+              f"type={response.headers.get('Content-Type', 'unknown')} "
+              f"bytes={len(response.content)} challenge={challenge}")
+    if response.status_code in (403, 429) or challenge:
+        log(f"  ! crawl paused: {detail}")
+        raise FetchPaused(detail, retry_after=retry_after_seconds(
+            response.headers.get("Retry-After", "")))
+    return detail
+
+
 def fetch(session: requests.Session, url: str) -> requests.Response | None:
+    """Fetch a page, retry transient errors, and report blocked access."""
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             r = session.get(url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
-            challenge = is_challenge(r)
-            detail = (f"{diagnostic_url(url)} -> HTTP {r.status_code} "
-                      f"final={diagnostic_url(r.url)} "
-                      f"type={r.headers.get('Content-Type', 'unknown')} "
-                      f"bytes={len(r.content)} challenge={challenge}")
-            if r.status_code in (403, 429) or challenge:
-                log(f"  ! crawl paused: {detail}")
-                raise FetchPaused(detail, retry_after=retry_after_seconds(
-                    r.headers.get("Retry-After", "")))
+            detail = check_response(r, url)
             if r.status_code in (200, 404):
                 return r
             log(f"  ! attempt {attempt}/{MAX_RETRIES}: {detail}")
@@ -326,6 +339,7 @@ def sitemap_category_paths(session: requests.Session) -> list[str]:
     _sitemap_checked_at = now
     try:
         index = session.get(SITEMAP_INDEX, timeout=10)
+        check_response(index, SITEMAP_INDEX)
         index.raise_for_status()
         sitemap_urls = [node.text for node in ET.fromstring(index.content).iter()
                         if node.tag.endswith("}loc") and node.text]
@@ -334,6 +348,7 @@ def sitemap_category_paths(session: requests.Session) -> list[str]:
             if urlparse(url).netloc != "www.chromehearts.com":
                 continue
             response = session.get(url, timeout=10)
+            check_response(response, url)
             response.raise_for_status()
             for node in ET.fromstring(response.content).iter():
                 if not node.tag.endswith("}loc") or not node.text:
@@ -354,10 +369,17 @@ def sitemap_category_paths(session: requests.Session) -> list[str]:
 
 
 def crawl(session: requests.Session) -> CrawlResult:
+    """Collect products until coverage is complete or requests must pause."""
     catalog: dict[str, Product] = {}
+    try:
+        sitemap_paths = sitemap_category_paths(session)
+    except FetchPaused as exc:
+        summary = "sitemap refresh blocked; " + str(exc)
+        log(f"crawl coverage: {summary}")
+        return CrawlResult({}, 1, summary, exc.retry_after)
     queued = (["/"] + [f"/{c}" for c in CATEGORIES] +
               [f"{CATEGORY_ENDPOINT}?cgid={cid}" for cid in CATEGORY_IDS] +
-              sitemap_category_paths(session))
+              sitemap_paths)
     seen: set[str] = set()
     discovered = 0
     fetched = 0
@@ -432,6 +454,7 @@ def save_state(catalog: dict[str, Product | dict]) -> None:
 
 
 def write_json(path: Path, value: dict) -> None:
+    """Replace a JSON file atomically on its current filesystem."""
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(value, indent=2, ensure_ascii=False))
@@ -440,6 +463,7 @@ def write_json(path: Path, value: dict) -> None:
 
 @dataclass
 class HealthState:
+    """Incident status and deadlines that survive worker restarts."""
     failures: int = 0
     alerted: bool = False
     last_error: str = ""
@@ -448,6 +472,7 @@ class HealthState:
 
 
 def load_health() -> HealthState:
+    """Load persisted incident status without blocking on missing or invalid files."""
     try:
         state = HealthState(**json.loads(HEALTH_FILE.read_text()))
         if (type(state.failures) is not int or state.failures < 0 or
@@ -465,11 +490,15 @@ def load_health() -> HealthState:
 
 
 class HealthMonitor:
+    """Track consecutive failures and deliver one warning per incident."""
+
     def __init__(self, *, dry_run: bool):
+        """Use isolated in-memory tracking for diagnostic dry runs."""
         self.dry_run = dry_run
         self.state = HealthState() if dry_run else load_health()
 
     def persist(self) -> None:
+        """Save incident status while allowing recovery from volume write failures."""
         if not self.dry_run:
             try:
                 write_json(HEALTH_FILE, asdict(self.state))
@@ -478,6 +507,7 @@ class HealthMonitor:
                     "restart deduplication requires a writable persistent volume")
 
     def failure(self, exc: Exception) -> None:
+        """Record a failed sweep, defer requests, and warn after the threshold."""
         self.state.failures += 1
         self.state.last_error = str(exc)[:1000]
         delay = min(BACKOFF_MAX_SECONDS,
@@ -504,6 +534,7 @@ class HealthMonitor:
         self.persist()
 
     def success(self) -> None:
+        """Clear failures and retry any pending recovery notification."""
         if not (self.state.failures or self.state.alerted):
             return
         self.state.failures = 0
@@ -525,6 +556,7 @@ class HealthMonitor:
 
 
 def wait_until(deadline: float) -> None:
+    """Honor an epoch deadline in short, interruptible sleep intervals."""
     # Short waits allow interruption even when a server requests a long cooldown.
     while (remaining := deadline - time.time()) > 0:
         time.sleep(min(remaining, 30))
@@ -591,7 +623,21 @@ def notify_new(products: list[Product]) -> None:
 # --------------------------------------------------------------------------- #
 
 def sweep(session: requests.Session, *, seed: bool, dry_run: bool) -> None:
+    """Process a crawl without losing a server cooldown if later work fails."""
     result = crawl(session)
+    try:
+        process_crawl(result, seed=seed, dry_run=dry_run)
+    except MonitorFailure:
+        raise
+    except Exception as exc:
+        if not result.retry_after:
+            raise
+        raise MonitorFailure(f"{type(exc).__name__}: {exc}",
+                             retry_after=result.retry_after) from exc
+
+
+def process_crawl(result: CrawlResult, *, seed: bool, dry_run: bool) -> None:
+    """Deliver new products and update history after checking crawl coverage."""
     catalog, fetch_errors = result.catalog, result.errors
     if not catalog:
         raise MonitorFailure("crawl found no products; refusing to update state. " + result.summary,
@@ -619,7 +665,8 @@ def sweep(session: requests.Session, *, seed: bool, dry_run: bool) -> None:
 
     log(f"{len(catalog)} live, {len(new)} NEW:")
     for p in new:
-        log("   + " + p.pretty().replace("\n", " | "))
+        logged = replace(p, url=diagnostic_url(p.url))
+        log("   + " + logged.pretty().replace("\n", " | "))
     if dry_run:
         log("[dry-run] not sending.")
         return

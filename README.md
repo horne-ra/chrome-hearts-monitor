@@ -66,8 +66,9 @@ interval. HTTP 403, HTTP 429, and detected challenge pages stop that crawl early
 three consecutive exhausted page fetches also stop a crawl during a network
 outage. Valid products collected before a crawl is stopped are still processed.
 Server `Retry-After` values (seconds or HTTP dates) are honored up to one hour,
-including across restarts. A restart cannot force requests before a saved retry
-deadline. There is no attempt to bypass access challenges.
+including across normal `--loop` restarts. Normal loop runs wait for saved retry
+deadlines; explicit `--once`, `--seed`, and `--loop --dry-run` diagnostic runs do
+not load those deadlines. There is no attempt to bypass access challenges.
 
 Logs include a per-crawl HTTP status summary. Failed HTTP requests include the
 requested path, final URL, status, content type, response size, and challenge
