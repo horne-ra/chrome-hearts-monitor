@@ -745,6 +745,32 @@ class TierPollingTests(unittest.TestCase):
         html = '<sitemapindex/>' if 'sitemap' in url else PRODUCT_HTML
         return response(html=html, url=url)
 
+    def test_expanded_defaults_include_verified_accessories_and_real_sweatpants_route(self):
+        with patch.object(monitor.time, 'monotonic', return_value=0):
+            schedule = monitor.TierSchedule()
+        sweatpants = monitor.CATEGORY_ENDPOINT + '?cgid=SWEATPANTS'
+        self.assertIn(sweatpants, schedule.hot)
+        self.assertNotIn('/sweatpants', schedule.due)
+        self.assertEqual(list(schedule.due).count(sweatpants), 1)
+        self.assertLess(schedule.due[sweatpants], monitor.HOT_SECONDS)
+        for category in ('belt', 'bag', 'earring', 'scarf'):
+            self.assertIn('/' + category, schedule.hot)
+            self.assertLess(schedule.due['/' + category], monitor.HOT_SECONDS)
+        self.assertNotIn('/zip-up', schedule.due)
+        self.assertNotIn('/accessories', schedule.due)
+        self.assertEqual(len(schedule.hot), 11)
+        self.assertEqual(len(schedule.due) - len(schedule.hot), 25)
+        with patch.object(monitor.time, 'monotonic', return_value=100):
+            schedule.advance(sweatpants)
+        self.assertEqual(schedule.due[sweatpants], 160)
+
+    def test_hot_categories_override_can_choose_search_show_categories(self):
+        with patch.object(monitor, 'HOT_CATEGORIES', ['sweatpants', 'belt']):
+            schedule = monitor.TierSchedule()
+        self.assertEqual(schedule.hot, [monitor.CATEGORY_ENDPOINT + '?cgid=SWEATPANTS', '/belt'])
+        self.assertNotIn('/hoodie', schedule.hot)
+        self.assertIn('/hoodie', schedule.due)
+
     def test_hot_and_cold_requests_keep_independent_intervals(self):
         sent, _, _, _, _ = self.run_loop(self.healthy)
         by_path = {}

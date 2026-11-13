@@ -26,7 +26,7 @@ Key env vars:
     CH_STATE_FILE=/data/seen_products.json   # persistent volume path on Railway
     CH_HOT_SECONDS=60               # interval per hot category
     CH_COLD_SECONDS=600             # interval per cold page
-    CH_HOT_CATEGORIES=hat,eyewear,sunglasses,hoodie,jacket,t-shirt
+    CH_HOT_CATEGORIES=hat,eyewear,sunglasses,hoodie,jacket,t-shirt,sweatpants,belt,bag,earring,scarf
     CH_MAX_INDIVIDUAL=8             # items per message in a large batch
     CH_STARTUP_PING=1               # private notice after a successful first sweep
 """
@@ -63,7 +63,8 @@ HOT_SECONDS = max(1, int(os.environ.get("CH_HOT_SECONDS", "60")))
 COLD_SECONDS = max(1, int(os.environ.get("CH_COLD_SECONDS", "600")))
 HOT_CATEGORIES = list(dict.fromkeys(
     category.strip().strip("/") for category in os.environ.get(
-        "CH_HOT_CATEGORIES", "hat,eyewear,sunglasses,hoodie,jacket,t-shirt").split(",")
+        "CH_HOT_CATEGORIES", "hat,eyewear,sunglasses,hoodie,jacket,t-shirt,"
+        "sweatpants,belt,bag,earring,scarf").split(",")
     if category.strip().strip("/")))
 if not HOT_CATEGORIES or any(not re.fullmatch(r"[a-z0-9-]+", c) for c in HOT_CATEGORIES):
     raise ValueError("CH_HOT_CATEGORIES must contain comma-separated category slugs")
@@ -336,12 +337,20 @@ class MonitorSession(requests.Session):
             self.next_send = time.monotonic() + random.uniform(*INTRA_DELAY)
 
 
+def category_path(category: str) -> str:
+    """Resolve configured slugs to the storefront's actual category routes."""
+    for category_id in CATEGORY_IDS:
+        if category == category_id.lower():
+            return f"{CATEGORY_ENDPOINT}?cgid={category_id}"
+    return f"/{category}"
+
+
 class TierSchedule:
     """Schedule individual pages; never catch up missed polls in a burst."""
 
     def __init__(self):
         now = time.monotonic()
-        self.hot = [f"/{c}" for c in HOT_CATEGORIES]
+        self.hot = [category_path(c) for c in HOT_CATEGORIES]
         cold = list(dict.fromkeys(
             ["/"] + [f"/{c}" for c in CATEGORIES] +
             [f"{CATEGORY_ENDPOINT}?cgid={cid}" for cid in CATEGORY_IDS] +

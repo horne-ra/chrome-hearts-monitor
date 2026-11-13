@@ -30,9 +30,9 @@ just contribute nothing.
 
 The worker runs forever with two polling tiers:
 
-1. Hot categories (`hat,eyewear,sunglasses,hoodie,jacket,t-shirt`) each poll every
+1. Hot categories (`hat,eyewear,sunglasses,hoodie,jacket,t-shirt,sweatpants,belt,bag,earring,scarf`) each poll every
    60 seconds by default. Their first polls are staggered across that minute.
-2. All other known categories, Search-Show categories, the homepage and sitemap
+2. All categories outside the configured hot list, the homepage and sitemap
    documents each poll every 600 seconds. Cold polls are spread across the interval.
    Newly discovered categories and child sitemaps join future cold slots; they are
    never fetched recursively in a burst. Missed polls are re-spread after cooldowns.
@@ -43,7 +43,14 @@ The worker runs forever with two polling tiers:
    own cold poll. Product redirects are still followed. Every HTTP request keeps
    the existing 0.2–0.6 second jittered minimum gap.
 
-Defaults schedule 6 hot polls/minute plus about 3 cold polls/minute. Actual HTTP
+The hot defaults include sweatpants, belts, bags, earrings and scarves as well as
+hats, eyewear, sunglasses, hoodies, jackets and T-shirts. `sweatpants` maps to
+`Search-Show?cgid=SWEATPANTS`, rather than an unverified `/sweatpants` URL.
+The live sitemap/menu did not expose a dedicated zip-up category, and `/zip-up`
+and generic `/accessories` returned 404 during verification. Hoodies and jackets
+remain hot; individual accessory routes are used instead of a generic route.
+
+Defaults schedule 11 hot polls/minute plus about 2.5 cold polls/minute. Actual HTTP
 traffic also includes product redirects, new categories and transient retries;
 use request-accounting logs to measure the real rate.
 
@@ -173,12 +180,13 @@ of link-preview cards while keeping every product directly clickable.
    `CH_STATE_FILE=/data/seen_products.json`, and the existing health file and
    webhook secrets. Keep the start command `python chrome_hearts_monitor.py --loop`.
    Do not run `--seed`, delete history, or add another notifying service.
-3. Set/verify `CH_HOT_CATEGORIES=hat,eyewear,sunglasses,hoodie,jacket,t-shirt`,
+3. Set/verify `CH_HOT_CATEGORIES=hat,eyewear,sunglasses,hoodie,jacket,t-shirt,sweatpants,belt,bag,earring,scarf`,
    `CH_HOT_SECONDS=60`, `CH_COLD_SECONDS=600`, and `CH_BACKOFF_MAX_SECONDS=3600`.
-   An old explicit `CH_BACKOFF_MAX_SECONDS=300` overrides the new default and
-   needs updating. `CH_POLL_SECONDS` no longer sets polling frequency. Redeploy
+   An existing explicit `CH_HOT_CATEGORIES` value overrides the expanded default
+   list and needs updating. An old explicit `CH_BACKOFF_MAX_SECONDS=300` also
+   overrides the new default and needs updating. `CH_POLL_SECONDS` no longer sets polling frequency. Redeploy
    after variable changes. These are operator steps; this PR does not apply them.
-4. Confirm the startup log says `6 hot pages every 60s, 30 cold pages every 600s`.
+4. Confirm the startup log says `11 hot pages every 60s, 25 cold pages every 600s`.
    While the old outbound address remains blocked, expect the first 403 to end
    fetching and then only single-category probes at increasing intervals. The
    existing private outage incident/reminders should continue.
@@ -209,9 +217,10 @@ settings were accessed.
 | Run | Measured window | HTTP requests | HTTP requests/minute | Blocked |
 | --- | --- | --- | --- | --- |
 | Original `fd8b71c`, original loop cadence | 60.0003 seconds, 2 sweeps | 134 | 134.00 | 0 |
-| Tiered polling, defaults | 900 seconds (12:37:15–12:52:15 Pacific) | 150 | 10.00 | 0 |
+| Initial tiered configuration, six hot categories | 900 seconds (12:37:15–12:52:15 Pacific) | 150 | 10.00 | 0 |
+| Expanded defaults, eleven hot categories | 900 seconds (12:57:34–13:12:34 Pacific) | 217 | 14.47 | 0 |
 
-The new run made **135 scheduled page polls = 9.00 polls/minute**; the additional
+That initial six-category run made **135 scheduled page polls = 9.00 polls/minute**; the additional
 15 requests followed eyewear redirects to MIO LORD. The before/after HTTP counts
 include actual redirect traffic, which the earlier ~68 page-polls/minute estimate
 excluded. MIO LORD (`21978827FE50010`) was detected on all 15 eyewear polls.
@@ -224,7 +233,13 @@ full coverage and recovery timing also have deterministic clock tests.
 request accounting: window_seconds=900.0 requests=150 blocked=0 requests_per_minute=10.00 total_requests=150 total_blocked=0
 ```
 
-Validation: `.venv/bin/python -m unittest -q` — 72 tests passed; `git diff --check`
+The expanded eleven-category run made **202 scheduled polls =
+13.47 polls/minute**, with 0 fetch errors and
+15 MIO LORD detections. Its temporary history was also byte-for-byte
+unchanged, with no health file created. The additional hot categories account
+for the higher rate; the 60-second hot interval is unchanged.
+
+Validation: `.venv/bin/python -m unittest -q` — 74 tests passed; `git diff --check`
 passed. Hourly production logs will establish the ongoing rate after discovery.
 
 ## Discord webhook
@@ -313,7 +328,7 @@ python ww_slots_monitor.py --loop                  # appointment Railway service
 
 | Var | Default | Meaning |
 |-----|---------|---------|
-| `CH_HOT_CATEGORIES` | `hat,eyewear,sunglasses,hoodie,jacket,t-shirt` | comma-separated hot category slugs; at least one required |
+| `CH_HOT_CATEGORIES` | `hat,eyewear,sunglasses,hoodie,jacket,t-shirt,sweatpants,belt,bag,earring,scarf` | comma-separated hot category slugs; `sweatpants` resolves to its Search-Show route; at least one required |
 | `CH_HOT_SECONDS` | `60` | interval per hot category |
 | `CH_COLD_SECONDS` | `600` | interval per cold category, homepage and sitemap document |
 | `CH_POLL_SECONDS` | `30` | legacy setting used only as the base for non-block failure retries; no longer controls polling |
