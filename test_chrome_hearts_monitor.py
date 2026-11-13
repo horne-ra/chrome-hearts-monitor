@@ -753,16 +753,18 @@ class TierPollingTests(unittest.TestCase):
         self.assertNotIn('/sweatpants', schedule.due)
         self.assertEqual(list(schedule.due).count(sweatpants), 1)
         self.assertLess(schedule.due[sweatpants], monitor.HOT_SECONDS)
-        for category in ('belt', 'bag', 'earring', 'scarf'):
+        for category in ('belt', 'bag', 'earring', 'scarf', 'pants', 'denim'):
             self.assertIn('/' + category, schedule.hot)
             self.assertLess(schedule.due['/' + category], monitor.HOT_SECONDS)
         self.assertNotIn('/zip-up', schedule.due)
         self.assertNotIn('/accessories', schedule.due)
-        self.assertEqual(len(schedule.hot), 11)
-        self.assertEqual(len(schedule.due) - len(schedule.hot), 25)
+        self.assertEqual(len(schedule.hot), 13)
+        self.assertEqual(len(schedule.due) - len(schedule.hot), 23)
         with patch.object(monitor.time, 'monotonic', return_value=100):
-            schedule.advance(sweatpants)
-        self.assertEqual(schedule.due[sweatpants], 160)
+            for path in (sweatpants, '/pants', '/denim'):
+                schedule.advance(path)
+        for path in (sweatpants, '/pants', '/denim'):
+            self.assertEqual(schedule.due[path], 160)
 
     def test_hot_categories_override_can_choose_search_show_categories(self):
         with patch.object(monitor, 'HOT_CATEGORIES', ['sweatpants', 'belt']):

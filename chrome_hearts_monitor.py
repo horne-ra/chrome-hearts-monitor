@@ -26,7 +26,7 @@ Key env vars:
     CH_STATE_FILE=/data/seen_products.json   # persistent volume path on Railway
     CH_HOT_SECONDS=60               # interval per hot category
     CH_COLD_SECONDS=600             # interval per cold page
-    CH_HOT_CATEGORIES=hat,eyewear,sunglasses,hoodie,jacket,t-shirt,sweatpants,belt,bag,earring,scarf
+    CH_HOT_CATEGORIES=hat,eyewear,sunglasses,hoodie,jacket,t-shirt,sweatpants,belt,bag,earring,scarf,pants,denim
     CH_MAX_INDIVIDUAL=8             # items per message in a large batch
     CH_STARTUP_PING=1               # private notice after a successful first sweep
 """
@@ -64,7 +64,7 @@ COLD_SECONDS = max(1, int(os.environ.get("CH_COLD_SECONDS", "600")))
 HOT_CATEGORIES = list(dict.fromkeys(
     category.strip().strip("/") for category in os.environ.get(
         "CH_HOT_CATEGORIES", "hat,eyewear,sunglasses,hoodie,jacket,t-shirt,"
-        "sweatpants,belt,bag,earring,scarf").split(",")
+        "sweatpants,belt,bag,earring,scarf,pants,denim").split(",")
     if category.strip().strip("/")))
 if not HOT_CATEGORIES or any(not re.fullmatch(r"[a-z0-9-]+", c) for c in HOT_CATEGORIES):
     raise ValueError("CH_HOT_CATEGORIES must contain comma-separated category slugs")
