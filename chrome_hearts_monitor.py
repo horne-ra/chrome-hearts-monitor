@@ -320,6 +320,8 @@ class MonitorSession(requests.Session):
         self.next_send = 0.0
 
     def _record_response(self, response, *args, **kwargs):
+        # Requests invokes this hook before a redirect's nested self.send().
+        self.next_send = time.monotonic() + random.uniform(*INTRA_DELAY)
         if response.status_code in (403, 429) or is_challenge(response):
             self.accounting.blocked += 1
             self.accounting.total_blocked += 1
@@ -334,7 +336,8 @@ class MonitorSession(requests.Session):
         try:
             return super().send(request, **kwargs)
         finally:
-            self.next_send = time.monotonic() + random.uniform(*INTRA_DELAY)
+            # Also pace requests after transport failures or slow body reads.
+            self.next_send = max(self.next_send, time.monotonic() + random.uniform(*INTRA_DELAY))
 
 
 def category_path(category: str) -> str:
@@ -374,7 +377,9 @@ class TierSchedule:
             log(f"scheduled discovered {'sitemap' if xml else 'category'}: {path}")
 
     def next(self) -> tuple[str, float]:
-        path = min(self.due, key=self.due.get)
+        # After cooldown an overdue cold page must run even if the first hot
+        # page fails every time. Equal deadlines therefore favor cold pages.
+        path = min(self.due, key=lambda p: (self.due[p], p in self.hot))
         return path, self.due[path]
 
     def advance(self, path: str) -> None:
@@ -385,13 +390,17 @@ class TierSchedule:
         self.had_products = False
 
     def resume(self) -> None:
-        """Re-spread polls after a cooldown instead of bursting overdue pages."""
+        """Preserve cold deadlines and fairly pace overdue pages after cooldown."""
         now = time.monotonic()
-        cold = [path for path in self.due if path not in self.hot]
+        cold = sorted((path for path in self.due if path not in self.hot), key=self.due.get)
         self.due.update({path: now + i * HOT_SECONDS / len(self.hot)
                          for i, path in enumerate(self.hot)})
-        self.due.update({path: now + (i + 0.5) * COLD_SECONDS / len(cold)
-                         for i, path in enumerate(cold)})
+        next_cold = now
+        for path in cold:
+            # Never pull a future poll forward or restart its waiting period.
+            # The oldest overdue page runs now; the rest keep the cold gap.
+            self.due[path] = max(self.due[path], next_cold)
+            next_cold = self.due[path] + COLD_SECONDS / len(cold)
         self.reset_coverage()
 
     def coverage_complete(self) -> bool:

@@ -35,7 +35,10 @@ The worker runs forever with two polling tiers:
 2. All categories outside the configured hot list, the homepage and sitemap
    documents each poll every 600 seconds. Cold polls are spread across the interval.
    Newly discovered categories and child sitemaps join future cold slots; they are
-   never fetched recursively in a burst. Missed polls are re-spread after cooldowns.
+   never fetched recursively in a burst. Cold deadlines survive cooldowns;
+   overdue pages resume oldest first with cold-tier spacing. The oldest overdue
+   cold page runs before a hot page with an equal deadline, so repeated hot-page
+   failures cannot keep postponing every cold poll once normal polling resumes.
 3. Each successful page poll parses products and diffs them against persistent
    PID history. Only unseen PIDs are new. Size inference and Discord formatting
    remain the same. Empty/sold-out pages leave history untouched.
@@ -73,8 +76,9 @@ Health warnings are sent after three consecutive failed sweeps by default, with
 private reminders every six hours while failures continue. Set
 `CH_HEALTH_REMINDER_SECONDS` to change the interval, or `0` to disable reminders.
 Warnings explicitly say product alerts may be missing and show the last product
-history update and its age. This timestamp reflects the latest successful page
-poll; it is not proof that every category was covered.
+history update and its age. This timestamp reflects the latest successful poll
+that contained products. Empty pages and sitemap polls do not update it, and it
+is not proof that every category was covered.
 A separate `seen_products.health.json` file next to the product
 history stores the failure count, notification status, and retry deadline, so
 restarts on the same persistent volume do not repeat an already delivered
@@ -248,7 +252,7 @@ The recorded 15-minute rates above apply to the earlier configurations, not
 this final list. Both added routes were checked live, and scheduling tests
 verify that they occupy hot slots and repeat at the hot interval.
 
-Validation: `.venv/bin/python -m unittest -q` — 74 tests passed; `git diff --check`
+Validation: `.venv/bin/python -m unittest -q` — 79 tests passed; `git diff --check`
 passed. Hourly production logs will establish the ongoing rate after discovery.
 
 ## Discord webhook

@@ -845,9 +845,62 @@ class TierPollingTests(unittest.TestCase):
         with patch.object(monitor.time, 'monotonic', return_value=10000):
             schedule.resume()
         cold_times = sorted(at for path, at in schedule.due.items() if path not in schedule.hot)
-        self.assertGreater(cold_times[0], 10000)
+        self.assertEqual(cold_times[0], 10000)
         self.assertGreater(cold_times[-1] - cold_times[0], 500)
         self.assertFalse(schedule.completed)
+
+    def test_resume_preserves_future_deadlines_and_rotates_served_cold_pages(self):
+        with patch.object(monitor.time, 'monotonic', return_value=0), \
+             patch.object(monitor, 'HOT_CATEGORIES', ['hat', 'eyewear']), \
+             patch.object(monitor, 'CATEGORIES', ['hat', 'eyewear', 'socks']), \
+             patch.object(monitor, 'CATEGORY_IDS', []):
+            schedule = monitor.TierSchedule()
+        with patch.object(monitor.time, 'monotonic', return_value=90):
+            schedule.resume()
+        self.assertEqual(schedule.due['/'], 100)  # Not restarted at +100.
+        with patch.object(monitor.time, 'monotonic', return_value=100):
+            schedule.advance('/')
+        with patch.object(monitor.time, 'monotonic', return_value=1000):
+            schedule.resume()
+        self.assertEqual(schedule.next(), ('/socks', 1000))
+        self.assertEqual(schedule.due['/sitemap_index.xml'], 1200)
+        self.assertEqual(schedule.due['/'], 1400)  # Served homepage moved last.
+
+    def test_repeated_failure_before_first_cold_slot_cannot_starve_cold_pages(self):
+        for failing_path in ('/hat', '/eyewear'):
+            with self.subTest(failing_path=failing_path):
+                def responder(url, count):
+                    if url == monitor.BASE + failing_path:
+                        return response(500, html='', url=url)
+                    return self.healthy(url, count)
+                # A hot failure happens at +0 or +30, before the first cold
+                # slot at +100. Resume must retain and eventually serve all
+                # three cold pages across multiple exponential cooldowns.
+                with patch.object(monitor, 'MAX_RETRIES', 1):
+                    sent, _, _, _, _ = self.run_loop(responder, duration=4000)
+                times = [at for at, _ in sent]
+                self.assertLess(len(times), 100)  # No catch-up request storm.
+                for path in ('/', '/socks', '/sitemap_index.xml'):
+                    polls = [at for at, url in sent if url == monitor.BASE + path]
+                    self.assertTrue(polls, path)
+                    self.assertTrue(all(b - a >= monitor.COLD_SECONDS
+                                        for a, b in zip(polls, polls[1:])))
+
+    def test_cold_pages_progress_between_successful_probes_and_repeated_hot_blocks(self):
+        def responder(url, count):
+            if url == monitor.BASE + '/eyewear':
+                return response(403, html='', url=url)
+            return self.healthy(url, count)
+
+        sent, _, _, _, _ = self.run_loop(responder, duration=1300)
+        for path in ('/', '/socks', '/sitemap_index.xml'):
+            self.assertTrue(any(url == monitor.BASE + path for _, url in sent), path)
+        # Every blocked attempt stops normal polling until the one hot probe.
+        for index, (at, url) in enumerate(sent[:-1]):
+            if url == monitor.BASE + '/eyewear':
+                probe_at, probe_url = sent[index + 1]
+                self.assertEqual(probe_url, monitor.BASE + '/hat')
+                self.assertGreaterEqual(probe_at - at, 300)
 
     def test_empty_scheduled_page_leaves_history_untouched(self):
         with patch.object(monitor, 'load_state') as load, patch.object(monitor, 'save_state') as save:
@@ -967,6 +1020,46 @@ class RequestAccountingTests(unittest.TestCase):
             session.get(monitor.BASE + '/start')
         self.assertEqual(session.accounting.total_requests, 2)
         self.assertEqual(session.accounting.total_blocked, 1)
+
+    def test_sitemap_automatic_redirect_keeps_gap_before_nested_send(self):
+        clock = [1.0]
+        sent = []
+
+        def send(adapter, request, **kwargs):
+            sent.append((clock[0], request.url))
+            if len(sent) == 1:
+                return response(302, headers={'Location': '/index.xml'}, url=request.url)
+            return response(html='<sitemapindex/>', url=request.url)
+
+        with patch.object(monitor.time, 'monotonic', side_effect=lambda: clock[0]), \
+             patch.object(monitor.time, 'sleep', side_effect=lambda seconds: clock.__setitem__(0, clock[0] + seconds)), \
+             patch.object(monitor.random, 'uniform', return_value=0.4), \
+             patch.object(monitor, '_sitemap_checked_at', 0), \
+             patch.object(monitor.requests.adapters.HTTPAdapter, 'send', send):
+            with monitor.MonitorSession() as session:
+                self.assertEqual(monitor.sitemap_category_paths(session), [])
+        self.assertEqual([url for _, url in sent], [monitor.SITEMAP_INDEX, monitor.BASE + '/index.xml'])
+        self.assertAlmostEqual(sent[1][0] - sent[0][0], 0.4)
+
+    def test_transport_failure_still_paces_the_next_send(self):
+        clock = [0.0]
+        attempts = []
+
+        def send(adapter, request, **kwargs):
+            attempts.append(clock[0])
+            if len(attempts) == 1:
+                raise monitor.requests.ConnectionError()
+            return response(url=request.url)
+
+        with patch.object(monitor.time, 'monotonic', side_effect=lambda: clock[0]), \
+             patch.object(monitor.time, 'sleep', side_effect=lambda seconds: clock.__setitem__(0, clock[0] + seconds)), \
+             patch.object(monitor.random, 'uniform', return_value=0.4), \
+             patch.object(monitor.requests.adapters.HTTPAdapter, 'send', send):
+            with monitor.MonitorSession() as session:
+                with self.assertRaises(monitor.requests.ConnectionError):
+                    session.get(monitor.BASE)
+                session.get(monitor.BASE)
+        self.assertEqual(attempts, [0, 0.4])
 
     def test_failed_connection_is_still_a_sent_attempt(self):
         session = monitor.MonitorSession()
