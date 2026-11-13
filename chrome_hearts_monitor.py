@@ -25,7 +25,7 @@ Key env vars:
     CH_STATE_FILE=/data/seen_products.json   # persistent volume path on Railway
     CH_POLL_SECONDS=30              # target seconds between sweep starts
     CH_MAX_INDIVIDUAL=8             # items per message in a large batch
-    CH_STARTUP_PING=1               # send a "monitor online" Discord msg on boot
+    CH_STARTUP_PING=1               # private notice after a successful first sweep
 """
 
 from __future__ import annotations
@@ -39,6 +39,7 @@ import sys
 import time
 from collections import Counter
 from dataclasses import dataclass, asdict, replace
+from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -63,6 +64,7 @@ HEALTH_FILE = Path(os.environ.get("CH_HEALTH_FILE", str(STATE_FILE.with_suffix("
 HEALTH_FAILURE_THRESHOLD = max(1, int(os.environ.get("CH_HEALTH_FAILURE_THRESHOLD", "3")))
 BACKOFF_MAX_SECONDS = max(POLL_SECONDS, int(os.environ.get("CH_BACKOFF_MAX_SECONDS", "300")))
 NOTIFICATION_RETRY_SECONDS = 60
+HEALTH_REMINDER_SECONDS = max(0, int(os.environ.get("CH_HEALTH_REMINDER_SECONDS", "21600")))
 
 # Broad net: every known category slug. Live ones render grids; the rest are
 # valid-but-usually-empty and populate when a drop lands -- which is the point.
@@ -215,6 +217,7 @@ def is_challenge(response: requests.Response) -> bool:
         return False
     return any(marker in html for marker in (
         "<title>just a moment", "<title>access denied",
+        "<title>attention required! | cloudflare",
         "/cdn-cgi/challenge-platform/", "verify you are human",
     ))
 
@@ -472,6 +475,7 @@ class HealthState:
     last_error: str = ""
     next_sweep_at: float = 0
     next_notification_at: float = 0
+    last_alert_at: float = 0
 
 
 def load_health() -> HealthState:
@@ -482,7 +486,8 @@ def load_health() -> HealthState:
                 type(state.alerted) is not bool or
                 not isinstance(state.last_error, str) or
                 not all(isinstance(value, (int, float)) and 0 <= value < float("inf")
-                        for value in (state.next_sweep_at, state.next_notification_at))):
+                        for value in (state.next_sweep_at, state.next_notification_at,
+                                      state.last_alert_at))):
             raise ValueError("invalid health state")
         return state
     except FileNotFoundError:
@@ -493,7 +498,7 @@ def load_health() -> HealthState:
 
 
 class HealthMonitor:
-    """Track consecutive failures and deliver one warning per incident."""
+    """Track failures and keep prolonged incidents visible privately."""
 
     def __init__(self, *, dry_run: bool):
         """Load cooldowns in every loop mode; dry runs never persist changes."""
@@ -516,24 +521,41 @@ class HealthMonitor:
         delay = min(BACKOFF_MAX_SECONDS,
                     max(2, POLL_SECONDS) * 2 ** min(self.state.failures, 16))
         delay = max(delay, getattr(exc, "retry_after", 0))
-        self.state.next_sweep_at = time.time() + delay
+        now = time.time()
+        self.state.next_sweep_at = now + delay
         self.persist()
         log(f"{self.state.failures} consecutive failed sweeps; retrying in {delay:.0f}s")
-        if (self.dry_run or self.state.alerted or
+        if (self.dry_run or
                 self.state.failures < HEALTH_FAILURE_THRESHOLD or
-                time.time() < self.state.next_notification_at):
+                now < self.state.next_notification_at):
             return
-        self.state.next_notification_at = time.time() + NOTIFICATION_RETRY_SECONDS
+        if self.state.alerted and (not HEALTH_REMINDER_SECONDS or
+                (self.state.last_alert_at and
+                 now - self.state.last_alert_at < HEALTH_REMINDER_SECONDS)):
+            return
+        self.state.next_notification_at = now + NOTIFICATION_RETRY_SECONDS
         self.persist()
+        status = "is still failing" if self.state.alerted else "needs attention"
         try:
-            _send_health("\u26a0\ufe0f Chrome Hearts product monitor needs attention "
+            updated_at = STATE_FILE.stat().st_mtime
+            updated = datetime.fromtimestamp(updated_at, timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+            history = (f"Last product-history update: {updated} "
+                       f"({max(0, now - updated_at) / 3600:.1f} hours ago).")
+        except (OSError, ValueError, OverflowError):
+            history = "Last product-history update: unavailable."
+        reminder = (f"Private reminders repeat every {HEALTH_REMINDER_SECONDS / 3600:g} hours until recovery."
+                    if HEALTH_REMINDER_SECONDS else "Further warnings are suppressed until recovery.")
+        try:
+            _send_health(f"\u26a0\ufe0f Chrome Hearts product monitor {status} "
                   f"after {self.state.failures} consecutive failed sweeps: "
                   f"{self.state.last_error}\n"
-                  "Retrying with backoff. Further warnings are suppressed until recovery.")
+                  f"Product alerts may be missing. {history}\n"
+                  f"Retrying with backoff. {reminder}")
         except Exception as alert_exc:
             log(f"health alert failed: {alert_exc!r}")
             return
         self.state.alerted = True
+        self.state.last_alert_at = now
         self.persist()
 
     def success(self) -> None:
@@ -715,15 +737,10 @@ def main() -> int:
         ap.error("CH_HEALTH_FILE must differ from CH_STATE_FILE")
 
     health = HealthMonitor(dry_run=args.dry_run)
-    log(f"Chrome Hearts monitor online. {len(CATEGORIES)} base categories + homepage, "
+    log(f"Chrome Hearts worker started; awaiting successful sweep. {len(CATEGORIES)} base categories + homepage, "
         f"~{POLL_SECONDS}s sweeps. state={STATE_FILE}")
-    if STARTUP_PING and not args.dry_run and not (health.state.failures or health.state.alerted):
-        try:
-            _send_health(f"\U0001f7e2 Chrome Hearts monitor online — watching "
-                  f"{len(CATEGORIES)} base categories + discovered links, "
-                  f"~{POLL_SECONDS}s sweeps.")
-        except Exception as exc:  # don't die if the first ping fails
-            log(f"startup ping failed: {exc}")
+    startup_pending = (STARTUP_PING and not args.dry_run and
+                       not (health.state.failures or health.state.alerted))
 
     while True:
         wait_until(health.state.next_sweep_at)
@@ -731,10 +748,19 @@ def main() -> int:
         try:
             sweep(session, seed=False, dry_run=args.dry_run)
         except Exception as exc:  # never let one bad sweep kill the worker
+            startup_pending = False
             log(f"sweep error (continuing): {exc!r}")
             health.failure(exc)
         else:
             health.success()
+            if startup_pending:
+                startup_pending = False
+                try:
+                    _send_health("\U0001f7e2 Chrome Hearts monitor online — "
+                                 "first complete product sweep succeeded. "
+                                 f"Watching {len(CATEGORIES)} base categories + discovered links.")
+                except Exception as exc:
+                    log(f"startup ping failed: {exc}")
         elapsed = time.monotonic() - t0
         time.sleep(max(2.0, POLL_SECONDS - elapsed) + random.uniform(0, 4))
 
