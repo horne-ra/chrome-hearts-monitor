@@ -24,6 +24,7 @@ def response(status=200, html=PRODUCT_HTML, headers=None, url=PRODUCT_URL):
     result = monitor.requests.Response()
     result.status_code = status
     result.url = url
+    result.request = monitor.requests.Request('GET', url).prepare()
     result._content = html.encode()
     result.headers.update(headers or {"Content-Type": "text/html"})
     return result
@@ -112,7 +113,9 @@ class ProductDiscoveryTests(unittest.TestCase):
 
         with patch.object(monitor, "_sitemap_checked_at", 0.0), \
              patch.object(monitor, "_sitemap_paths", ['/known']):
-            self.assertEqual(monitor.sitemap_category_paths(Session()), ['/known'])
+            with self.assertRaises(monitor.MonitorFailure):
+                monitor.sitemap_category_paths(Session())
+            self.assertEqual(monitor._sitemap_paths, ['/known'])
 
     def test_dry_run_does_not_mark_product_seen(self):
         """Verify dry run does not mark product seen."""
@@ -173,8 +176,8 @@ class ProductDiscoveryTests(unittest.TestCase):
                  patch.object(monitor, "notify_new") as notify:
                 with self.assertRaisesRegex(RuntimeError, 'coverage may be incomplete'):
                     monitor.sweep(object(), seed=False, dry_run=False)
-            notify.assert_called_once()
-            self.assertIn('190372BLKXXX01W', state.read_text())
+            notify.assert_not_called()
+            self.assertEqual(state.read_text(), '{"old": {}}')
 
     def test_discord_http_error_is_a_delivery_failure(self):
         """Verify discord http error is a delivery failure."""
@@ -263,16 +266,19 @@ class FetchDiagnosticsTests(unittest.TestCase):
         self.assertEqual(len(result.catalog), 1)
         self.assertEqual(result.errors, 0)
 
-    def test_other_sitemap_http_failures_keep_cached_categories(self):
+    def test_other_sitemap_http_failures_keep_cache_but_fail_the_sweep(self):
         """Verify other sitemap http failures keep cached categories."""
         session = monitor.requests.Session()
         with patch.object(monitor, "_sitemap_checked_at", 0.0), \
              patch.object(monitor, "_sitemap_paths", ["/known"]), \
              patch.object(session, "get", return_value=response(503)):
-            self.assertEqual(monitor.sitemap_category_paths(session), ["/known"])
+            with self.assertRaises(monitor.MonitorFailure):
+                monitor.sitemap_category_paths(session)
+            self.assertEqual(monitor._sitemap_paths, ["/known"])
+            self.assertEqual(monitor._sitemap_checked_at, 0)
 
-    def test_post_crawl_errors_keep_server_cooldown(self):
-        """Verify post crawl errors keep server cooldown."""
+    def test_failed_crawl_preserves_cooldown_without_processing(self):
+        """Coverage failures stop state reads, writes and notifications before processing."""
         products = monitor.parse_products(PRODUCT_HTML, PRODUCT_URL)
         for target in ("load_state", "save_state", "notify_new"):
             with self.subTest(target=target), tempfile.TemporaryDirectory() as directory:
@@ -281,11 +287,11 @@ class FetchDiagnosticsTests(unittest.TestCase):
                 with patch.object(monitor, "STATE_FILE", state), \
                      patch.object(monitor, "crawl", return_value=monitor.CrawlResult(products, 1, "HTTP 429", 900)), \
                      patch.object(monitor, "notify_new"), \
-                     patch.object(monitor, target, side_effect=RuntimeError("later failure")):
+                     patch.object(monitor, target, side_effect=RuntimeError("later failure")) as processing:
                     with self.assertRaises(monitor.MonitorFailure) as caught:
                         monitor.sweep(object(), seed=False, dry_run=False)
                 self.assertEqual(caught.exception.retry_after, 900)
-                self.assertIsInstance(caught.exception.__cause__, RuntimeError)
+                processing.assert_not_called()
 
     def test_product_logs_strip_queries_without_changing_notification_urls(self):
         """Verify product logs strip queries without changing notification urls."""
@@ -361,7 +367,9 @@ class FetchDiagnosticsTests(unittest.TestCase):
             self.assertEqual(monitor.retry_after_seconds(formatdate(1120, usegmt=True)), 120)
         self.assertEqual(monitor.retry_after_seconds("not a date"), 0)
         self.assertEqual(monitor.retry_after_seconds("-5"), 0)
-        self.assertEqual(monitor.retry_after_seconds("99999"), 3600)
+        self.assertEqual(monitor.retry_after_seconds("99999"), 99999)
+        self.assertEqual(monitor.retry_after_seconds("inf"), 0)
+        self.assertEqual(monitor.retry_after_seconds("nan"), 0)
 
     def test_server_errors_retry_without_sleeping_after_final_attempt(self):
         """Verify server errors retry without sleeping after final attempt."""
@@ -407,8 +415,8 @@ class FetchDiagnosticsTests(unittest.TestCase):
             with self.assertRaisesRegex(monitor.MonitorFailure, "empty page samples"):
                 monitor.sweep(object(), seed=False, dry_run=False)
 
-    def test_products_before_blocking_are_still_delivered_and_recorded(self):
-        """Verify products before blocking are still delivered and recorded."""
+    def test_products_before_blocking_are_not_delivered_or_recorded(self):
+        """Products collected before a block must not change history or notify."""
         with tempfile.TemporaryDirectory() as directory:
             state = Path(directory) / "seen.json"
             state.write_text('{"old": {}}')
@@ -420,8 +428,8 @@ class FetchDiagnosticsTests(unittest.TestCase):
                 with self.assertRaises(monitor.MonitorFailure) as caught:
                     monitor.sweep(object(), seed=False, dry_run=False)
             self.assertEqual(caught.exception.retry_after, 600)
-            notify.assert_called_once()
-            self.assertIn("190372BLKXXX01W", json.loads(state.read_text()))
+            notify.assert_not_called()
+            self.assertEqual(state.read_text(), '{"old": {}}')
 
 
 class NotificationRoutingTests(unittest.TestCase):
@@ -578,14 +586,13 @@ class HealthIncidentTests(unittest.TestCase):
                                        "last_alert_at": monitor.time.time()})
         with patch.object(sys, "argv", ["monitor", "--loop"]), \
              patch.object(monitor, "STARTUP_PING", True), \
-             patch.object(monitor, "wait_until") as wait, \
+             patch.object(monitor.time, "time", return_value=1000), \
              patch.object(monitor, "sweep", side_effect=RuntimeError("still down")) as sweep, \
              patch.object(monitor.time, "sleep", side_effect=StopIteration), \
              patch.object(monitor, "_send_health") as send:
             with self.assertRaises(StopIteration):
                 monitor.main()
-        wait.assert_called_once_with(1600)
-        sweep.assert_called_once()
+        sweep.assert_not_called()
         send.assert_not_called()
 
     def test_reminder_deadline_survives_restarts(self):
@@ -659,6 +666,7 @@ class HealthIncidentTests(unittest.TestCase):
         with patch.object(sys, "argv", ["monitor", "--loop"]), \
              patch.object(monitor, "STARTUP_PING", True), \
              patch.object(monitor, "sweep"), \
+             patch.object(monitor.TierSchedule, "coverage_complete", return_value=True), \
              patch.object(monitor.time, "sleep", side_effect=StopIteration), \
              patch.object(monitor, "_send_health") as health_send, \
              patch.object(monitor, "_send") as product_send:
@@ -673,13 +681,12 @@ class HealthIncidentTests(unittest.TestCase):
         monitor.write_json(self.path, {"failures": 3, "alerted": True, "next_sweep_at": 1600})
         before = self.path.read_bytes()
         with patch.object(sys, "argv", ["monitor", "--loop", "--dry-run"]), \
-             patch.object(monitor, "wait_until") as wait, \
+             patch.object(monitor.time, "time", return_value=1000), \
              patch.object(monitor, "sweep", side_effect=RuntimeError("still down")), \
              patch.object(monitor.time, "sleep", side_effect=StopIteration), \
              patch.object(monitor, "_send_health") as send:
             with self.assertRaises(StopIteration):
                 monitor.main()
-        wait.assert_called_once_with(1600)
         self.assertEqual(self.path.read_bytes(), before)
         send.assert_not_called()
 
@@ -696,6 +703,264 @@ class HealthIncidentTests(unittest.TestCase):
             for _ in range(3):
                 health.failure(RuntimeError("crawl failed"))
             self.assertTrue(health.state.alerted)
+
+
+class TierPollingTests(unittest.TestCase):
+    def run_loop(self, responder, *, duration=1300, dry_run=True, saved=None):
+        clock = [0.0]
+        sent = []
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        history = Path(directory.name) / 'history.json'
+        health = Path(directory.name) / 'health.json'
+        history.write_text('{"old": {}}')
+        if saved:
+            monitor.write_json(health, saved)
+
+        def send(adapter, request, **kwargs):
+            sent.append((clock[0], request.url))
+            return responder(request.url, len(sent))
+
+        with patch.object(sys, 'argv', ['monitor', '--loop', '--duration', str(duration)] +
+                          (['--dry-run'] if dry_run else [])), \
+             patch.object(monitor, 'STATE_FILE', history), \
+             patch.object(monitor, 'HEALTH_FILE', health), \
+             patch.object(monitor, 'HOT_CATEGORIES', ['hat', 'eyewear']), \
+             patch.object(monitor, 'CATEGORIES', ['hat', 'eyewear', 'socks']), \
+             patch.object(monitor, 'CATEGORY_IDS', []), \
+             patch.object(monitor, 'BACKOFF_MAX_SECONDS', 3600), \
+             patch.object(monitor.time, 'monotonic', side_effect=lambda: clock[0]), \
+             patch.object(monitor.time, 'time', side_effect=lambda: 1000 + clock[0]), \
+             patch.object(monitor.time, 'sleep', side_effect=lambda seconds: clock.__setitem__(0, clock[0] + seconds)), \
+             patch.object(monitor.random, 'uniform', return_value=0), \
+             patch.object(monitor.requests.adapters.HTTPAdapter, 'send', send), \
+             patch.object(monitor, 'log'), \
+             patch.object(monitor, 'notify_new') as notify, \
+             patch.object(monitor, '_send_health') as health_send:
+            monitor.main()
+        return sent, history.read_bytes(), health, notify, health_send
+
+    @staticmethod
+    def healthy(url, count):
+        html = '<sitemapindex/>' if 'sitemap' in url else PRODUCT_HTML
+        return response(html=html, url=url)
+
+    def test_hot_and_cold_requests_keep_independent_intervals(self):
+        sent, _, _, _, _ = self.run_loop(self.healthy)
+        by_path = {}
+        for at, url in sent:
+            by_path.setdefault(url.removeprefix(monitor.BASE), []).append(at)
+        for path, times in by_path.items():
+            interval = 60 if path in ('/hat', '/eyewear') else 600
+            self.assertGreaterEqual(len(times), 2)
+            self.assertTrue(all(abs(b - a - interval) < 0.001 for a, b in zip(times, times[1:])))
+        self.assertEqual([by_path[p][0] for p in ('/', '/socks', '/sitemap_index.xml')], [100, 300, 500])
+
+    def test_block_switches_loop_to_one_probe_and_resets_after_success(self):
+        def responder(url, count):
+            return response(403, url=url) if count <= 2 else self.healthy(url, count)
+        sent, history, _, notify, _ = self.run_loop(responder, duration=1000)
+        self.assertEqual(sent[:3], [(0, monitor.BASE + '/hat'),
+                                   (300, monitor.BASE + '/hat'),
+                                   (900, monitor.BASE + '/hat')])
+        self.assertGreater(len(sent), 3)  # Normal tier polls resumed after probe.
+        self.assertEqual(history, b'{"old": {}}')
+        notify.assert_not_called()
+
+    def test_persisted_block_waits_then_only_probes_and_preserves_history(self):
+        saved = {'failures': 3, 'alerted': True, 'blocked': True, 'block_failures': 2,
+                 'next_sweep_at': 1600, 'last_alert_at': 1000}
+        sent, history, health, notify, _ = self.run_loop(
+            lambda url, _: response(429, url=url), duration=1000, saved=saved)
+        self.assertEqual(sent, [(600, monitor.BASE + '/hat')])
+        self.assertEqual(history, b'{"old": {}}')
+        self.assertEqual(json.loads(health.read_text()), saved)  # Dry run is read-only.
+        notify.assert_not_called()
+
+    def test_reminders_continue_during_long_retry_after_without_requests(self):
+        saved = {'failures': 8, 'alerted': True, 'blocked': True, 'block_failures': 7,
+                 'next_sweep_at': 100000, 'last_alert_at': 1}
+        with patch.object(monitor, 'HEALTH_REMINDER_SECONDS', 100):
+            sent, _, _, _, health_send = self.run_loop(self.healthy, duration=61,
+                                                       saved=saved, dry_run=False)
+        self.assertEqual(sent, [])
+        health_send.assert_called_once()
+        self.assertIn('is still failing', health_send.call_args.args[0])
+
+    def test_pending_recovery_retries_without_waiting_for_another_full_cycle(self):
+        saved = {'failures': 0, 'alerted': True, 'next_notification_at': 1300}
+        _, _, _, _, health_send = self.run_loop(self.healthy, duration=400,
+                                                saved=saved, dry_run=False)
+        health_send.assert_called_once()
+        self.assertIn('recovered', health_send.call_args.args[0])
+
+    def test_discovered_categories_and_child_sitemaps_wait_for_cold_slots(self):
+        with patch.object(monitor.time, 'monotonic', return_value=0):
+            schedule = monitor.TierSchedule()
+            session = monitor.requests.Session()
+            with patch.object(session, 'get', return_value=response(
+                    html='<a href="/brand-new">New</a>')) as get:
+                monitor.scheduled_crawl(session, schedule, '/eyewear')
+            get.assert_called_once()
+            self.assertGreater(schedule.due['/brand-new'], 0)
+            index = ('<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+                     '<sitemap><loc>https://www.chromehearts.com/sitemap_0.xml</loc></sitemap></sitemapindex>')
+            with patch.object(session, 'get', return_value=response(html=index)) as get:
+                monitor.scheduled_crawl(session, schedule, '/sitemap_index.xml')
+            get.assert_called_once()
+            self.assertIn('/sitemap_0.xml', schedule.xml)
+            self.assertGreater(schedule.due['/sitemap_0.xml'], 0)
+
+    def test_resume_spreads_overdue_cold_pages_instead_of_catching_up(self):
+        with patch.object(monitor.time, 'monotonic', return_value=0):
+            schedule = monitor.TierSchedule()
+        with patch.object(monitor.time, 'monotonic', return_value=10000):
+            schedule.resume()
+        cold_times = sorted(at for path, at in schedule.due.items() if path not in schedule.hot)
+        self.assertGreater(cold_times[0], 10000)
+        self.assertGreater(cold_times[-1] - cold_times[0], 500)
+        self.assertFalse(schedule.completed)
+
+    def test_empty_scheduled_page_leaves_history_untouched(self):
+        with patch.object(monitor, 'load_state') as load, patch.object(monitor, 'save_state') as save:
+            monitor.process_crawl(monitor.CrawlResult({}, 0, partial=True), seed=False, dry_run=False)
+        load.assert_not_called()
+        save.assert_not_called()
+
+    def test_complete_empty_coverage_is_an_outage(self):
+        schedule = monitor.TierSchedule()
+        schedule.completed = set(schedule.due)
+        with self.assertRaisesRegex(monitor.MonitorFailure, 'no products'):
+            schedule.coverage_complete()
+
+    def test_failure_does_not_clear_until_complete_coverage(self):
+        def responder(url, count):
+            return response(403, url=url) if count == 1 else self.healthy(url, count)
+        sent, _, health, _, health_send = self.run_loop(responder, duration=400, dry_run=False)
+        state = json.loads(health.read_text())
+        self.assertFalse(state['blocked'])
+        self.assertEqual(state['block_failures'], 0)
+        self.assertGreater(state['failures'], 0)
+        health_send.assert_not_called()  # Probe success alone cannot announce recovery.
+
+
+class BlockBackoffTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.path = Path(directory.name) / 'health.json'
+        for p in (patch.object(monitor, 'HEALTH_FILE', self.path),
+                  patch.object(monitor, 'BACKOFF_MAX_SECONDS', 3600),
+                  patch.object(monitor.time, 'time', return_value=1000),
+                  patch.object(monitor.random, 'uniform', return_value=0),
+                  patch.object(monitor, '_send_health')):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_backoff_sequence_cap_and_restart(self):
+        health = monitor.HealthMonitor(dry_run=False)
+        for delay in (300, 600, 1200, 2400, 3600, 3600, 3600):
+            health.failure(monitor.FetchPaused('HTTP 403'))
+            health = monitor.HealthMonitor(dry_run=False)
+            self.assertTrue(health.state.blocked)
+            self.assertEqual(health.state.next_sweep_at, 1000 + delay)
+
+    def test_backoff_jitter_is_bounded_and_still_applies_at_the_cap(self):
+        health = monitor.HealthMonitor(dry_run=False)
+        with patch.object(monitor.random, 'uniform', side_effect=lambda low, high: high):
+            health.failure(monitor.FetchPaused('HTTP 403'))
+            self.assertEqual(health.state.next_sweep_at, 1330)
+            health.state.block_failures = 7
+            health.failure(monitor.FetchPaused('HTTP 403'))
+            self.assertEqual(health.state.next_sweep_at, 4240)
+
+    def test_retry_after_takes_precedence_including_more_than_one_hour(self):
+        health = monitor.HealthMonitor(dry_run=False)
+        health.failure(monitor.FetchPaused('HTTP 429', retry_after=7200))
+        self.assertEqual(health.state.next_sweep_at, 8200)
+        health.failure(RuntimeError('probe connection failed'))
+        self.assertEqual(health.state.next_sweep_at, 1600)
+        self.assertTrue(health.state.blocked)
+
+    def test_successful_probe_resets_backoff_but_keeps_incident(self):
+        health = monitor.HealthMonitor(dry_run=False)
+        for _ in range(4):
+            health.failure(monitor.FetchPaused('HTTP 403'))
+        health.probe_success()
+        health = monitor.HealthMonitor(dry_run=False)
+        self.assertEqual(health.state.block_failures, 0)
+        self.assertEqual(health.state.next_sweep_at, 0)
+        self.assertTrue(health.state.alerted)
+        health.failure(monitor.FetchPaused('HTTP 429'))
+        self.assertEqual(health.state.next_sweep_at, 1300)
+
+    def test_probe_never_follows_redirects_retries_or_writes_history(self):
+        session = monitor.requests.Session()
+        for status in (200, 302, 403, 429, 503):
+            with self.subTest(status=status), \
+                 patch.object(session, 'get', return_value=response(status, headers={'Location': '/'})) as get, \
+                 patch.object(monitor, 'save_state') as save:
+                if status in (200, 302):
+                    monitor.probe(session, '/hat')
+                else:
+                    with self.assertRaises(monitor.MonitorFailure):
+                        monitor.probe(session, '/hat')
+                get.assert_called_once_with(monitor.BASE + '/hat', timeout=monitor.REQUEST_TIMEOUT,
+                                            allow_redirects=False)
+                save.assert_not_called()
+
+    def test_empty_category_redirect_skips_homepage_but_product_redirect_is_followed(self):
+        session = monitor.requests.Session()
+        with patch.object(session, 'get', return_value=response(302, headers={'Location': '/'})) as get:
+            self.assertEqual(monitor.fetch(session, monitor.BASE + '/hat').status_code, 302)
+        get.assert_called_once()
+        with patch.object(session, 'get', side_effect=[
+                response(302, headers={'Location': '/eyewear/mio-lord/21978827FE50010.html'}),
+                response()]) as get:
+            self.assertEqual(monitor.fetch(session, monitor.BASE + '/eyewear').status_code, 200)
+        self.assertEqual(get.call_count, 2)
+
+    def test_block_on_redirect_target_ends_without_retry(self):
+        session = monitor.requests.Session()
+        with patch.object(session, 'get', side_effect=[
+                response(302, headers={'Location': '/product.html'}), response(403)]) as get:
+            with self.assertRaises(monitor.FetchPaused):
+                monitor.fetch(session, monitor.BASE + '/eyewear')
+        self.assertEqual(get.call_count, 2)
+
+
+class RequestAccountingTests(unittest.TestCase):
+    def test_wire_redirects_and_blocked_responses_are_counted_once(self):
+        session = monitor.MonitorSession()
+        with patch.object(monitor.time, 'sleep'), \
+             patch.object(monitor.requests.adapters.HTTPAdapter, 'send', side_effect=[
+                 response(302, headers={'Location': '/target'}, url=monitor.BASE + '/start'),
+                 response(403, url=monitor.BASE + '/target')]):
+            session.get(monitor.BASE + '/start')
+        self.assertEqual(session.accounting.total_requests, 2)
+        self.assertEqual(session.accounting.total_blocked, 1)
+
+    def test_failed_connection_is_still_a_sent_attempt(self):
+        session = monitor.MonitorSession()
+        with patch.object(monitor.requests.adapters.HTTPAdapter, 'send',
+                          side_effect=monitor.requests.ConnectionError):
+            with self.assertRaises(monitor.requests.ConnectionError):
+                session.get(monitor.BASE)
+        self.assertEqual(session.accounting.total_requests, 1)
+
+    def test_hourly_log_rolls_over_and_retains_totals(self):
+        with patch.object(monitor.time, 'monotonic', return_value=0):
+            accounting = monitor.RequestAccounting()
+        accounting.requests = accounting.total_requests = 540
+        accounting.blocked = accounting.total_blocked = 2
+        with patch.object(monitor.time, 'monotonic', return_value=3600), \
+             patch.object(monitor, 'log') as log:
+            accounting.report()
+            accounting.report()
+        log.assert_called_once()
+        self.assertIn('requests=540 blocked=2 requests_per_minute=9.00', log.call_args.args[0])
+        self.assertEqual(accounting.requests, 0)
+        self.assertEqual(accounting.total_requests, 540)
 
 
 if __name__ == "__main__":

@@ -2,10 +2,11 @@
 """
 Chrome Hearts new-product monitor (always-on / Railway edition).
 
-Runs as a long-lived worker: every ~30s it sweeps all Chrome Hearts category
-pages, builds the live product set, diffs against the last sweep, and posts any
-new product (name + price + link) to Discord. State persists to disk so it
-survives restarts -- on Railway, point CH_STATE_FILE at a mounted volume.
+Runs as a long-lived worker: hot categories poll every minute, while cold
+categories, the homepage and sitemaps are spread across ten minutes. Each
+successful poll diffs products against persistent PID history and posts new
+products (name + price + link) to Discord. On Railway, keep CH_STATE_FILE on
+the existing mounted volume. Blocked access pauses polling for single-page probes.
 
 Chrome Hearts is a Salesforce Commerce Cloud (Demandware/SFRA) storefront behind
 Cloudflare. Live category pages render product tiles server-side; each tile has a
@@ -23,7 +24,9 @@ Key env vars:
     NOTIFY_METHOD=discord            (see notifier.py)
     DISCORD_WEBHOOK_URL=...
     CH_STATE_FILE=/data/seen_products.json   # persistent volume path on Railway
-    CH_POLL_SECONDS=30              # target seconds between sweep starts
+    CH_HOT_SECONDS=60               # interval per hot category
+    CH_COLD_SECONDS=600             # interval per cold page
+    CH_HOT_CATEGORIES=hat,eyewear,sunglasses,hoodie,jacket,t-shirt
     CH_MAX_INDIVIDUAL=8             # items per message in a large batch
     CH_STARTUP_PING=1               # private notice after a successful first sweep
 """
@@ -32,6 +35,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import random
 import re
@@ -42,7 +46,7 @@ from dataclasses import dataclass, asdict, replace
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlparse, urljoin
 
 import requests
 from defusedxml import ElementTree as ET
@@ -55,6 +59,14 @@ from defusedxml.common import DefusedXmlException
 BASE = "https://www.chromehearts.com"
 STATE_FILE = Path(os.environ.get("CH_STATE_FILE", "seen_products.json"))
 POLL_SECONDS = int(os.environ.get("CH_POLL_SECONDS", "30"))
+HOT_SECONDS = max(1, int(os.environ.get("CH_HOT_SECONDS", "60")))
+COLD_SECONDS = max(1, int(os.environ.get("CH_COLD_SECONDS", "600")))
+HOT_CATEGORIES = list(dict.fromkeys(
+    category.strip().strip("/") for category in os.environ.get(
+        "CH_HOT_CATEGORIES", "hat,eyewear,sunglasses,hoodie,jacket,t-shirt").split(",")
+    if category.strip().strip("/")))
+if not HOT_CATEGORIES or any(not re.fullmatch(r"[a-z0-9-]+", c) for c in HOT_CATEGORIES):
+    raise ValueError("CH_HOT_CATEGORIES must contain comma-separated category slugs")
 MAX_INDIVIDUAL = int(os.environ.get("CH_MAX_INDIVIDUAL", "8"))
 STARTUP_PING = os.environ.get("CH_STARTUP_PING", "1") == "1"
 SUMMARY_MESSAGE_LIMIT = 1850  # leave headroom below Discord's 2,000-char limit
@@ -62,7 +74,7 @@ SITEMAP_INDEX = BASE + "/sitemap_index.xml"
 SITEMAP_REFRESH_SECONDS = 600
 HEALTH_FILE = Path(os.environ.get("CH_HEALTH_FILE", str(STATE_FILE.with_suffix(".health.json"))))
 HEALTH_FAILURE_THRESHOLD = max(1, int(os.environ.get("CH_HEALTH_FAILURE_THRESHOLD", "3")))
-BACKOFF_MAX_SECONDS = max(POLL_SECONDS, int(os.environ.get("CH_BACKOFF_MAX_SECONDS", "300")))
+BACKOFF_MAX_SECONDS = min(3600, max(300, int(os.environ.get("CH_BACKOFF_MAX_SECONDS", "3600"))))
 NOTIFICATION_RETRY_SECONDS = 60
 HEALTH_REMINDER_SECONDS = max(0, int(os.environ.get("CH_HEALTH_REMINDER_SECONDS", "21600")))
 
@@ -94,8 +106,8 @@ HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
-# Small jittered gap between page fetches within a sweep so 34 pages read like a
-# steady trickle (~1 req/s) rather than a synchronized burst that trips Cloudflare.
+# Minimum jittered gap between HTTP requests, including product redirects.
+# Tier scheduling supplies the longer gaps between ordinary page polls.
 INTRA_DELAY = (0.2, 0.6)
 REQUEST_TIMEOUT = 25
 MAX_RETRIES = 3
@@ -183,6 +195,8 @@ class CrawlResult:
     errors: int
     summary: str = ""
     retry_after: float = 0
+    blocked: bool = False
+    partial: bool = False
 
 
 def diagnostic_url(url: str) -> str:
@@ -196,7 +210,7 @@ def diagnostic_url(url: str) -> str:
 
 
 def retry_after_seconds(value: str) -> float:
-    """Parse Retry-After seconds or HTTP dates, bounded to one hour."""
+    """Parse Retry-After seconds or HTTP dates without shortening server delays."""
     try:
         seconds = float(value)
     except ValueError:
@@ -204,8 +218,7 @@ def retry_after_seconds(value: str) -> float:
             seconds = parsedate_to_datetime(value).timestamp() - time.time()
         except (ValueError, TypeError, OverflowError):
             return 0
-    # Bound malformed or unreasonable server values to one hour.
-    return max(0, min(seconds, 3600))
+    return max(0, seconds) if math.isfinite(seconds) else 0
 
 
 def is_challenge(response: requests.Response) -> bool:
@@ -241,8 +254,24 @@ def fetch(session: requests.Session, url: str) -> requests.Response | None:
     """Fetch a page, retry transient errors, and report blocked access."""
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            r = session.get(url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
-            detail = check_response(r, url)
+            target = url
+            for redirect in range(11):
+                r = session.get(target, timeout=REQUEST_TIMEOUT, allow_redirects=False)
+                detail = check_response(r, target)
+                if r.status_code not in (301, 302, 303, 307, 308):
+                    break
+                location = r.headers.get("Location", "")
+                destination = urljoin(target, location)
+                if (not location or urlparse(destination).scheme != "https" or
+                        urlparse(destination).netloc != urlparse(BASE).netloc):
+                    return None
+                # Empty categories redirect home. The homepage has its own cold
+                # poll; do not download the same empty destination on every poll.
+                if destination.rstrip("/") == BASE:
+                    return r
+                if redirect == 10:
+                    return None
+                target = destination
             if r.status_code in (200, 404):
                 return r
             log(f"  ! attempt {attempt}/{MAX_RETRIES}: {detail}")
@@ -257,6 +286,166 @@ def fetch(session: requests.Session, url: str) -> requests.Response | None:
         if attempt < MAX_RETRIES:
             time.sleep(delay + random.uniform(0, 0.5))
     return None
+
+
+class RequestAccounting:
+    """Count wire requests (including redirects/retries) in hourly windows."""
+
+    def __init__(self):
+        self.started = time.monotonic()
+        self.requests = 0
+        self.blocked = 0
+        self.total_requests = 0
+        self.total_blocked = 0
+
+    def report(self, *, force: bool = False) -> None:
+        elapsed = time.monotonic() - self.started
+        if elapsed < 3600 and not force:
+            return
+        log(f"request accounting: window_seconds={elapsed:.1f} requests={self.requests} "
+            f"blocked={self.blocked} requests_per_minute={self.requests * 60 / max(1, elapsed):.2f} "
+            f"total_requests={self.total_requests} total_blocked={self.total_blocked}")
+        self.started = time.monotonic()
+        self.requests = self.blocked = 0
+
+
+class MonitorSession(requests.Session):
+    """Account for every HTTP send, even automatic redirects and failures."""
+
+    def __init__(self):
+        super().__init__()
+        self.accounting = RequestAccounting()
+        self.hooks["response"].append(self._record_response)
+        self.next_send = 0.0
+
+    def _record_response(self, response, *args, **kwargs):
+        if response.status_code in (403, 429) or is_challenge(response):
+            self.accounting.blocked += 1
+            self.accounting.total_blocked += 1
+
+    def send(self, request, **kwargs):
+        remaining = self.next_send - time.monotonic()
+        if remaining > 0:
+            time.sleep(remaining)
+        self.accounting.report()
+        self.accounting.requests += 1
+        self.accounting.total_requests += 1
+        try:
+            return super().send(request, **kwargs)
+        finally:
+            self.next_send = time.monotonic() + random.uniform(*INTRA_DELAY)
+
+
+class TierSchedule:
+    """Schedule individual pages; never catch up missed polls in a burst."""
+
+    def __init__(self):
+        now = time.monotonic()
+        self.hot = [f"/{c}" for c in HOT_CATEGORIES]
+        cold = list(dict.fromkeys(
+            ["/"] + [f"/{c}" for c in CATEGORIES] +
+            [f"{CATEGORY_ENDPOINT}?cgid={cid}" for cid in CATEGORY_IDS] +
+            ["/sitemap_index.xml"]))
+        cold = [path for path in cold if path not in self.hot]
+        self.xml = {"/sitemap_index.xml"}
+        self.due = {path: now + i * HOT_SECONDS / len(self.hot)
+                    for i, path in enumerate(self.hot)}
+        self.due.update({path: now + (i + 0.5) * COLD_SECONDS / len(cold)
+                         for i, path in enumerate(cold)})
+        self.completed: set[str] = set()
+        self.had_products = False
+
+    def add(self, path: str, *, xml: bool = False) -> None:
+        if xml:
+            self.xml.add(path)
+        if path not in self.due:
+            cold = [p for p in self.due if p not in self.hot]
+            gap = COLD_SECONDS / (len(cold) + 1)
+            self.due[path] = max(time.monotonic(), *(self.due[p] for p in cold)) + gap
+            log(f"scheduled discovered {'sitemap' if xml else 'category'}: {path}")
+
+    def next(self) -> tuple[str, float]:
+        path = min(self.due, key=self.due.get)
+        return path, self.due[path]
+
+    def advance(self, path: str) -> None:
+        self.due[path] = time.monotonic() + (HOT_SECONDS if path in self.hot else COLD_SECONDS)
+
+    def reset_coverage(self) -> None:
+        self.completed.clear()
+        self.had_products = False
+
+    def resume(self) -> None:
+        """Re-spread polls after a cooldown instead of bursting overdue pages."""
+        now = time.monotonic()
+        cold = [path for path in self.due if path not in self.hot]
+        self.due.update({path: now + i * HOT_SECONDS / len(self.hot)
+                         for i, path in enumerate(self.hot)})
+        self.due.update({path: now + (i + 0.5) * COLD_SECONDS / len(cold)
+                         for i, path in enumerate(cold)})
+        self.reset_coverage()
+
+    def coverage_complete(self) -> bool:
+        if self.completed >= self.due.keys():
+            if not self.had_products:
+                raise MonitorFailure("full sweep found no products; refusing to update state")
+            log(f"full sweep succeeded: {len(self.due)} scheduled pages covered; products detected")
+            self.reset_coverage()
+            return True
+        return False
+
+
+def scheduled_crawl(session: requests.Session, schedule: TierSchedule, path: str) -> CrawlResult:
+    """Fetch one scheduled page; discovery queues future cold polls only."""
+    try:
+        response = fetch(session, BASE + path)
+    except FetchPaused as exc:
+        return CrawlResult({}, 1, str(exc), exc.retry_after, blocked=True, partial=True)
+    if response is None:
+        return CrawlResult({}, 1, f"failed scheduled page {path}", partial=True)
+    if path in schedule.xml and response.status_code != 200:
+        return CrawlResult({}, 1, f"sitemap {path}: HTTP {response.status_code}", partial=True)
+    products = {}
+    if response.status_code == 200:
+        if path in schedule.xml:
+            try:
+                root = ET.fromstring(response.content)
+                is_index = root.tag.rsplit('}', 1)[-1] == 'sitemapindex'
+                locations = [n.text for n in root.iter() if n.tag.endswith('}loc') and n.text]
+                for url in locations[:4] if is_index else locations:
+                    parsed = urlparse(url)
+                    if parsed.scheme != "https" or parsed.netloc != "www.chromehearts.com":
+                        continue
+                    candidate = parsed.path.rstrip("/")
+                    if is_index:
+                        schedule.add(candidate, xml=True)
+                    elif (re.fullmatch(r"/[a-z0-9-]+", candidate) and
+                          candidate.lstrip("/") not in UTILITY_SLUGS):
+                        schedule.add(candidate)
+            except (ET.ParseError, DefusedXmlException) as exc:
+                return CrawlResult({}, 1, f"invalid sitemap {path}: {type(exc).__name__}", partial=True)
+        else:
+            products = parse_products(response.text, response.url)
+            for discovered in discover_category_paths(response.text):
+                schedule.add(discovered)
+    log(f"scheduled {'hot' if path in schedule.hot else 'cold'} page: {path} "
+        f"HTTP {response.status_code}, {len(products)} products")
+    return CrawlResult(products, 0, partial=True)
+
+
+def probe(session: requests.Session, path: str) -> None:
+    """Make exactly one HTTP request; a normal same-site redirect also proves access."""
+    response = session.get(BASE + path, timeout=REQUEST_TIMEOUT, allow_redirects=False)
+    detail = check_response(response, BASE + path)
+    location = urlparse(response.headers.get("Location", ""))
+    redirect_ok = (response.status_code in (301, 302, 303, 307, 308) and
+                   bool(response.headers.get("Location")) and
+                   location.netloc in ("", "www.chromehearts.com") and
+                   location.scheme in ("", "https"))
+    if response.status_code != 200 and not redirect_ok:
+        raise MonitorFailure("probe failed: " + detail,
+                             retry_after=retry_after_seconds(response.headers.get("Retry-After", "")))
+    log("access probe succeeded; resuming tiered polling")
 
 
 def parse_products(html: str, page_url: str = "") -> dict[str, Product]:
@@ -370,7 +559,8 @@ def sitemap_category_paths(session: requests.Session) -> list[str]:
         raise
     except (requests.RequestException, ET.ParseError, DefusedXmlException) as exc:
         log(f"sitemap refresh failed: {exc}")
-        return _sitemap_paths
+        _sitemap_checked_at = 0.0
+        raise MonitorFailure(f"sitemap refresh failed: {type(exc).__name__}") from exc
 
 
 def crawl(session: requests.Session) -> CrawlResult:
@@ -378,10 +568,11 @@ def crawl(session: requests.Session) -> CrawlResult:
     catalog: dict[str, Product] = {}
     try:
         sitemap_paths = sitemap_category_paths(session)
-    except FetchPaused as exc:
-        summary = "sitemap refresh blocked; " + str(exc)
+    except MonitorFailure as exc:
+        blocked = isinstance(exc, FetchPaused)
+        summary = f"sitemap refresh {'blocked' if blocked else 'failed'}; " + str(exc)
         log(f"crawl coverage: {summary}")
-        return CrawlResult({}, 1, summary, exc.retry_after)
+        return CrawlResult({}, 1, summary, exc.retry_after, blocked=blocked)
     queued = (["/"] + [f"/{c}" for c in CATEGORIES] +
               [f"{CATEGORY_ENDPOINT}?cgid={cid}" for cid in CATEGORY_IDS] +
               sitemap_paths)
@@ -395,6 +586,7 @@ def crawl(session: requests.Session) -> CrawlResult:
     empty_pages: list[str] = []
     paused = ""
     retry_after = 0.0
+    blocked = False
     for path in queued:
         if path in seen:
             continue
@@ -402,6 +594,7 @@ def crawl(session: requests.Session) -> CrawlResult:
         try:
             r = fetch(session, BASE + path)
         except FetchPaused as exc:
+            blocked = True
             errors += 1
             paused = str(exc)
             retry_after = exc.retry_after
@@ -439,7 +632,7 @@ def crawl(session: requests.Session) -> CrawlResult:
     if not catalog and empty_pages:
         summary += "; empty page samples: " + "; ".join(empty_pages)
     log(f"crawl coverage: {summary}")
-    return CrawlResult(catalog, errors, summary, retry_after)
+    return CrawlResult(catalog, errors, summary, retry_after, blocked=blocked)
 
 
 # --------------------------------------------------------------------------- #
@@ -476,6 +669,8 @@ class HealthState:
     next_sweep_at: float = 0
     next_notification_at: float = 0
     last_alert_at: float = 0
+    blocked: bool = False
+    block_failures: int = 0
 
 
 def load_health() -> HealthState:
@@ -483,6 +678,8 @@ def load_health() -> HealthState:
     try:
         state = HealthState(**json.loads(HEALTH_FILE.read_text()))
         if (type(state.failures) is not int or state.failures < 0 or
+                type(state.blocked) is not bool or
+                type(state.block_failures) is not int or state.block_failures < 0 or
                 type(state.alerted) is not bool or
                 not isinstance(state.last_error, str) or
                 not all(isinstance(value, (int, float)) and 0 <= value < float("inf")
@@ -518,13 +715,26 @@ class HealthMonitor:
         """Record a failed sweep, defer requests, and warn after the threshold."""
         self.state.failures += 1
         self.state.last_error = str(exc)[:1000]
-        delay = min(BACKOFF_MAX_SECONDS,
-                    max(2, POLL_SECONDS) * 2 ** min(self.state.failures, 16))
+        if isinstance(exc, FetchPaused):
+            self.state.blocked = True
+        if self.state.blocked:
+            self.state.block_failures += 1
+            base = min(BACKOFF_MAX_SECONDS, 300 * 2 ** min(self.state.block_failures - 1, 16))
+            jitter = random.uniform(0, base * 0.1)
+            delay = base - jitter if base == BACKOFF_MAX_SECONDS else min(BACKOFF_MAX_SECONDS, base + jitter)
+        else:
+            delay = min(BACKOFF_MAX_SECONDS,
+                        max(2, POLL_SECONDS) * 2 ** min(self.state.failures, 16))
         delay = max(delay, getattr(exc, "retry_after", 0))
         now = time.time()
         self.state.next_sweep_at = now + delay
         self.persist()
         log(f"{self.state.failures} consecutive failed sweeps; retrying in {delay:.0f}s")
+        self.notify_failure()
+
+    def notify_failure(self) -> None:
+        """Retry warnings and reminders independently of long probe deadlines."""
+        now = time.time()
         if (self.dry_run or
                 self.state.failures < HEALTH_FAILURE_THRESHOLD or
                 now < self.state.next_notification_at):
@@ -558,6 +768,13 @@ class HealthMonitor:
         self.state.last_alert_at = now
         self.persist()
 
+    def probe_success(self) -> None:
+        """Reset access backoff; defer recovery notice until full coverage succeeds."""
+        self.state.blocked = False
+        self.state.block_failures = 0
+        self.state.next_sweep_at = 0
+        self.persist()
+
     def success(self) -> None:
         """Clear failures and retry any pending recovery notification."""
         if not (self.state.failures or self.state.alerted):
@@ -578,13 +795,6 @@ class HealthMonitor:
                 return
         self.state = HealthState()
         self.persist()
-
-
-def wait_until(deadline: float) -> None:
-    """Honor an epoch deadline in short, interruptible sleep intervals."""
-    # Short waits allow interruption even when a server requests a long cooldown.
-    while (remaining := deadline - time.time()) > 0:
-        time.sleep(min(remaining, 30))
 
 
 # --------------------------------------------------------------------------- #
@@ -653,11 +863,15 @@ def notify_new(products: list[Product]) -> None:
 # Sweep
 # --------------------------------------------------------------------------- #
 
-def sweep(session: requests.Session, *, seed: bool, dry_run: bool) -> None:
+def sweep(session: requests.Session, *, seed: bool, dry_run: bool,
+          schedule: TierSchedule | None = None, path: str = "") -> None:
     """Process a crawl without losing a server cooldown if later work fails."""
-    result = crawl(session)
+    result = crawl(session) if schedule is None else scheduled_crawl(session, schedule, path)
     try:
         process_crawl(result, seed=seed, dry_run=dry_run)
+        if schedule is not None:
+            schedule.completed.add(path)
+            schedule.had_products |= bool(result.catalog)
     except MonitorFailure:
         raise
     except Exception as exc:
@@ -670,12 +884,17 @@ def sweep(session: requests.Session, *, seed: bool, dry_run: bool) -> None:
 def process_crawl(result: CrawlResult, *, seed: bool, dry_run: bool) -> None:
     """Deliver new products and update history after checking crawl coverage."""
     catalog, fetch_errors = result.catalog, result.errors
+    if fetch_errors:
+        failure = FetchPaused if result.blocked else MonitorFailure
+        raise failure("catalog coverage may be incomplete. " + result.summary,
+                      retry_after=result.retry_after)
+    if not catalog and result.partial:
+        # Empty/sold-out categories and sitemap polls are normal; retain history.
+        return
     if not catalog:
         raise MonitorFailure("crawl found no products; refusing to update state. " + result.summary,
                              retry_after=result.retry_after)
     if seed:
-        if fetch_errors:
-            raise RuntimeError("cannot seed while category fetches are failing")
         save_state(catalog)
         log(f"seeded {len(catalog)} products (no notifications).")
         return
@@ -689,9 +908,6 @@ def process_crawl(result: CrawlResult, *, seed: bool, dry_run: bool) -> None:
         log(f"{len(catalog)} live, 0 new.")
         if not dry_run:
             save_state(seen)
-        if fetch_errors:
-            raise MonitorFailure("catalog coverage may be incomplete. " + result.summary,
-                                 retry_after=result.retry_after)
         return
 
     log(f"{len(catalog)} live, {len(new)} NEW:")
@@ -704,9 +920,6 @@ def process_crawl(result: CrawlResult, *, seed: bool, dry_run: bool) -> None:
         notify_new(new)
         log("notified.")
         save_state(seen)
-    if fetch_errors:
-        raise MonitorFailure("catalog coverage may be incomplete. " + result.summary,
-                             retry_after=result.retry_after)
 
 
 # --------------------------------------------------------------------------- #
@@ -716,13 +929,14 @@ def process_crawl(result: CrawlResult, *, seed: bool, dry_run: bool) -> None:
 def main() -> int:
     """Run the selected monitor mode and recover from failures in loop mode."""
     ap = argparse.ArgumentParser(description="Chrome Hearts new-product monitor")
+    ap.add_argument("--duration", type=float, default=0, help="stop loop after this many seconds (0: forever)")
     ap.add_argument("--loop", action="store_true", help="run forever (Railway)")
     ap.add_argument("--once", action="store_true", help="one sweep then exit")
     ap.add_argument("--seed", action="store_true", help="record catalog, no alerts")
     ap.add_argument("--dry-run", action="store_true", help="detect but never send")
     args = ap.parse_args()
 
-    session = requests.Session()
+    session = MonitorSession()
     session.headers.update(HEADERS)
 
     if args.seed:
@@ -737,32 +951,68 @@ def main() -> int:
         ap.error("CH_HEALTH_FILE must differ from CH_STATE_FILE")
 
     health = HealthMonitor(dry_run=args.dry_run)
-    log(f"Chrome Hearts worker started; awaiting successful sweep. {len(CATEGORIES)} base categories + homepage, "
-        f"~{POLL_SECONDS}s sweeps. state={STATE_FILE}")
+    schedule = TierSchedule()
+    log(f"Chrome Hearts worker started; {len(schedule.hot)} hot pages every {HOT_SECONDS}s, "
+        f"{len(schedule.due) - len(schedule.hot)} cold pages every {COLD_SECONDS}s. state={STATE_FILE}")
     startup_pending = (STARTUP_PING and not args.dry_run and
                        not (health.state.failures or health.state.alerted))
-
-    while True:
-        wait_until(health.state.next_sweep_at)
-        t0 = time.monotonic()
-        try:
-            sweep(session, seed=False, dry_run=args.dry_run)
-        except Exception as exc:  # never let one bad sweep kill the worker
-            startup_pending = False
-            log(f"sweep error (continuing): {exc!r}")
-            health.failure(exc)
-        else:
-            health.success()
-            if startup_pending:
-                startup_pending = False
+    end = time.monotonic() + args.duration if args.duration > 0 else float("inf")
+    next_request = 0.0
+    try:
+        while time.monotonic() < end:
+            session.accounting.report()
+            if health.state.failures:
+                health.notify_failure()
+            elif health.state.alerted:
+                health.success()  # Retry a pending recovery notice on its own deadline.
+            path, due = schedule.next()
+            delay = max(health.state.next_sweep_at - time.time(), next_request - time.monotonic(),
+                        0 if health.state.blocked else due - time.monotonic())
+            if delay > 0:
+                time.sleep(min(delay, 30, max(0, end - time.monotonic())))
+                continue
+            if not health.state.blocked and health.state.next_sweep_at:
+                schedule.resume()
+                health.state.next_sweep_at = 0
+                health.persist()
+                path, due = schedule.next()
+            if health.state.blocked:
                 try:
-                    _send_health("\U0001f7e2 Chrome Hearts monitor online — "
-                                 "first complete product sweep succeeded. "
-                                 f"Watching {len(CATEGORIES)} base categories + discovered links.")
+                    probe(session, schedule.hot[0])
                 except Exception as exc:
-                    log(f"startup ping failed: {exc}")
-        elapsed = time.monotonic() - t0
-        time.sleep(max(2.0, POLL_SECONDS - elapsed) + random.uniform(0, 4))
+                    log(f"probe error (continuing): {exc!r}")
+                    health.failure(exc)
+                else:
+                    health.probe_success()
+                    schedule.resume()
+                next_request = time.monotonic() + random.uniform(*INTRA_DELAY)
+                continue
+            try:
+                sweep(session, seed=False, dry_run=args.dry_run, schedule=schedule, path=path)
+                complete = schedule.coverage_complete()
+            except Exception as exc:
+                startup_pending = False
+                log(f"sweep error (continuing): {exc!r}")
+                schedule.reset_coverage()
+                health.failure(exc)
+            else:
+                # A successful page is not proof of complete catalog coverage.
+                if complete:
+                    health.success()
+                    if startup_pending:
+                        startup_pending = False
+                        try:
+                            _send_health("\U0001f7e2 Chrome Hearts monitor online — "
+                                         "first complete product sweep succeeded. "
+                                         f"Watching {len(schedule.due)} scheduled pages.")
+                        except Exception as exc:
+                            log(f"startup ping failed: {exc}")
+            schedule.advance(path)
+            next_request = time.monotonic() + random.uniform(*INTRA_DELAY)
+    finally:
+        session.accounting.report(force=True)
+        session.close()
+    return 0
 
 
 if __name__ == "__main__":
