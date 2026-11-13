@@ -30,6 +30,29 @@ def response(status=200, html=PRODUCT_HTML, headers=None, url=PRODUCT_URL):
 
 
 class ProductDiscoveryTests(unittest.TestCase):
+    def test_eyewear_redirect_discovers_and_notifies_mio_lord(self):
+        """Reproduce the missed release using its redirected category and metadata."""
+        url = "https://www.chromehearts.com/eyewear/mio-lord/21978827FE50010.html"
+        html = ('<span class="product-metadata d-none" data-pid="21978827FE50010" '
+                'data-name="MIO LORD" data-price="1470.00" data-category="EYEWEAR"></span>')
+        self.assertIn("eyewear", monitor.CATEGORIES)
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "seen.json"
+            state.write_text('{"old": {}}')
+            with patch.object(monitor, "STATE_FILE", state), \
+                 patch.object(monitor, "CATEGORIES", ["eyewear"]), \
+                 patch.object(monitor, "CATEGORY_IDS", []), \
+                 patch.object(monitor, "sitemap_category_paths", return_value=[]), \
+                 patch.object(monitor, "fetch", side_effect=[response(html="", url=monitor.BASE),
+                                                           response(html=html, url=url)]), \
+                 patch.object(monitor.time, "sleep"), \
+                 patch.object(monitor, "notify_new") as notify:
+                monitor.sweep(object(), seed=False, dry_run=False)
+            product = notify.call_args.args[0][0]
+            self.assertEqual((product.pid, product.name, product.url),
+                             ("21978827FE50010", "MIO LORD", url))
+            self.assertIn(product.pid, json.loads(state.read_text()))
+
     def test_search_show_category_link_is_discovered(self):
         """Verify search show category link is discovered."""
         html = ('<a href="/on/demandware.store/Sites-ChromeHearts-Site/en_US/'
@@ -329,6 +352,8 @@ class FetchDiagnosticsTests(unittest.TestCase):
                 monitor.fetch(session, monitor.BASE)
         self.assertFalse(monitor.is_challenge(response(html="<!-- Needed for Recaptcha -->")))
         self.assertTrue(monitor.is_challenge(response(headers={"cf-mitigated": "challenge"})))
+        self.assertTrue(monitor.is_challenge(response(
+            403, html="<title>Attention Required! | Cloudflare</title>")))
 
     def test_retry_after_accepts_http_dates_and_bounds_invalid_values(self):
         """Verify retry after accepts http dates and bounds invalid values."""
@@ -454,6 +479,7 @@ class HealthIncidentTests(unittest.TestCase):
         for patcher in (patch.object(monitor, "HEALTH_FILE", self.path),
                         patch.object(monitor, "HEALTH_FAILURE_THRESHOLD", 3),
                         patch.object(monitor, "POLL_SECONDS", 30),
+                        patch.object(monitor, "HEALTH_REMINDER_SECONDS", 21600),
                         patch.object(monitor, "BACKOFF_MAX_SECONDS", 300)):
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -548,7 +574,8 @@ class HealthIncidentTests(unittest.TestCase):
 
     def test_loop_respects_persisted_cooldown_and_suppresses_startup_ping(self):
         """Verify loop respects persisted cooldown and suppresses startup ping."""
-        monitor.write_json(self.path, {"failures": 3, "alerted": True, "next_sweep_at": 1600})
+        monitor.write_json(self.path, {"failures": 3, "alerted": True, "next_sweep_at": 1600,
+                                       "last_alert_at": monitor.time.time()})
         with patch.object(sys, "argv", ["monitor", "--loop"]), \
              patch.object(monitor, "STARTUP_PING", True), \
              patch.object(monitor, "wait_until") as wait, \
@@ -559,6 +586,72 @@ class HealthIncidentTests(unittest.TestCase):
                 monitor.main()
         wait.assert_called_once_with(1600)
         sweep.assert_called_once()
+        send.assert_not_called()
+
+    def test_reminder_deadline_survives_restarts(self):
+        """Keep a persistent outage visible without repeating each failed sweep."""
+        with patch.object(monitor.time, "time", return_value=1000), \
+             patch.object(monitor, "_send_health") as send:
+            health = monitor.HealthMonitor(dry_run=False)
+            for _ in range(3):
+                health.failure(RuntimeError("HTTP 403"))
+            send.assert_called_once()
+        with patch.object(monitor.time, "time", return_value=22599), \
+             patch.object(monitor, "_send_health") as send:
+            monitor.HealthMonitor(dry_run=False).failure(RuntimeError("HTTP 403"))
+            send.assert_not_called()
+        with patch.object(monitor.time, "time", return_value=22600), \
+             patch.object(monitor, "_send_health") as send:
+            monitor.HealthMonitor(dry_run=False).failure(RuntimeError("HTTP 403"))
+            monitor.HealthMonitor(dry_run=False).failure(RuntimeError("HTTP 403"))
+            send.assert_called_once()
+            self.assertIn("is still failing", send.call_args.args[0])
+            self.assertIn("Product alerts may be missing", send.call_args.args[0])
+        self.assertEqual(monitor.load_health().last_alert_at, 22600)
+
+    def test_legacy_active_incident_gets_reminder_with_history_age(self):
+        """Upgrade an already-suppressed outage without resetting product history."""
+        monitor.write_json(self.path, {"failures": 1900, "alerted": True})
+        with patch.object(monitor.time, "time", return_value=10000), \
+             patch.object(monitor.STATE_FILE.__class__, "stat") as stat, \
+             patch.object(monitor, "_send_health") as send:
+            stat.return_value.st_mtime = 2800
+            monitor.HealthMonitor(dry_run=False).failure(RuntimeError("HTTP 403"))
+            send.assert_called_once()
+            self.assertIn("2.0 hours ago", send.call_args.args[0])
+
+    def test_failed_reminder_retries_after_cooldown(self):
+        """A failed reminder must not postpone retries for another six hours."""
+        monitor.write_json(self.path, {"failures": 20, "alerted": True, "last_alert_at": 1000})
+        with patch.object(monitor.time, "time", return_value=22600), \
+             patch.object(monitor, "_send_health", side_effect=RuntimeError("offline")) as send:
+            monitor.HealthMonitor(dry_run=False).failure(RuntimeError("HTTP 403"))
+            monitor.HealthMonitor(dry_run=False).failure(RuntimeError("HTTP 403"))
+            send.assert_called_once()
+        self.assertEqual(monitor.load_health().last_alert_at, 1000)
+        with patch.object(monitor.time, "time", return_value=22660), \
+             patch.object(monitor, "_send_health") as send:
+            monitor.HealthMonitor(dry_run=False).failure(RuntimeError("HTTP 403"))
+            send.assert_called_once()
+        self.assertEqual(monitor.load_health().last_alert_at, 22660)
+
+    def test_reminders_can_be_disabled(self):
+        """Allow the original one-warning policy through explicit configuration."""
+        monitor.write_json(self.path, {"failures": 20, "alerted": True})
+        with patch.object(monitor, "HEALTH_REMINDER_SECONDS", 0), \
+             patch.object(monitor, "_send_health") as send:
+            monitor.HealthMonitor(dry_run=False).failure(RuntimeError("HTTP 403"))
+        send.assert_not_called()
+
+    def test_initial_failed_sweep_does_not_announce_online(self):
+        """A running process cannot announce successful monitoring before fetching."""
+        with patch.object(sys, "argv", ["monitor", "--loop"]), \
+             patch.object(monitor, "STARTUP_PING", True), \
+             patch.object(monitor, "sweep", side_effect=RuntimeError("HTTP 403")), \
+             patch.object(monitor.time, "sleep", side_effect=StopIteration), \
+             patch.object(monitor, "_send_health") as send:
+            with self.assertRaises(StopIteration):
+                monitor.main()
         send.assert_not_called()
 
     def test_startup_notice_uses_health_route_only(self):

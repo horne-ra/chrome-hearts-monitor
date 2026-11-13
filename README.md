@@ -51,14 +51,21 @@ record newly found products as seen. Fetch failures in individual categories
 produce a health warning while successfully found products are still
 processed; seeding is blocked until all category fetches succeed.
 
-Health warnings are sent after three consecutive failed sweeps by default, once
-per incident. A separate `seen_products.health.json` file next to the product
+Health warnings are sent after three consecutive failed sweeps by default, with
+private reminders every six hours while failures continue. Set
+`CH_HEALTH_REMINDER_SECONDS` to change the interval, or `0` to disable reminders.
+Warnings explicitly say product alerts may be missing and show the last product
+history update and its age. This timestamp can include a partially successful
+crawl; it is not proof that every category was covered.
+A separate `seen_products.health.json` file next to the product
 history stores the failure count, notification status, and retry deadline, so
 restarts on the same persistent volume do not repeat an already delivered
-warning. A successful sweep clears the failure count and sends one recovery
+warning before its reminder deadline. Existing incidents created before reminder
+tracking receive a reminder on their next failed sweep. A successful sweep clears the failure count and sends one recovery
 message if a warning was delivered. Failed warning/recovery deliveries are
 retried with at least a minute between attempts. Startup pings are suppressed
-while an incident is active. Product history is never reset by health tracking.
+while an incident is active, and are sent only after a successful first sweep.
+Product history is never reset by health tracking.
 
 Product-monitor warnings, recovery messages, and startup notices go exclusively
 to `DISCORD_MONITOR_WEBHOOK_URL`. Product drops continue to use the existing
@@ -115,8 +122,10 @@ of link-preview cards while keeping every product directly clickable.
    instead of silently reseeding.
    Health tracking automatically uses `/data/seen_products.health.json` when
    the product state is `/data/seen_products.json`; no new variable is required.
-5. Deploy. You should get a "monitor online" Discord ping within a minute, then
-   alerts as drops land.
+5. Deploy. After a successful first sweep, the private issues channel receives a
+   "monitor online" notice. If crawling fails, the worker follows the incident
+   warning policy instead. Railway's green service status confirms that the
+   process is running; check crawl logs to confirm successful product detection.
 
 > The container is always-on by design (no scale-to-zero) — that's what makes
 > sub-minute detection possible. It's a tiny process and costs very little.
@@ -209,11 +218,12 @@ python ww_slots_monitor.py --loop                  # appointment Railway service
 |-----|---------|---------|
 | `CH_POLL_SECONDS` | `30` | target seconds between sweep starts |
 | `CH_MAX_INDIVIDUAL` | `8` | maximum items per message in a paginated large batch |
-| `CH_STARTUP_PING` | `1` | send a "monitor online" Discord ping on boot |
+| `CH_STARTUP_PING` | `1` | private notice after a successful first sweep |
 | `DISCORD_MONITOR_WEBHOOK_URL` | unset | private destination for product-monitor warnings, recovery messages, and startup notices; no fallback to the drop webhook |
 | `CH_STATE_FILE` | `seen_products.json` | snapshot path (set to `/data/...` on Railway) |
 | `CH_HEALTH_FILE` | product state path with `.health.json` suffix | persistent incident tracker; keep on the same volume |
 | `CH_HEALTH_FAILURE_THRESHOLD` | `3` | consecutive failed sweeps before an incident warning |
+| `CH_HEALTH_REMINDER_SECONDS` | `21600` | private reminder interval during an ongoing incident; `0` disables reminders |
 | `CH_BACKOFF_MAX_SECONDS` | `300` | maximum exponential sweep delay; a longer server `Retry-After` takes precedence, capped at one hour |
 
 Appointment monitor:
