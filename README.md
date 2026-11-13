@@ -200,6 +200,33 @@ of link-preview cards while keeping every product directly clickable.
    accounting:` report consistent with the measured rate. If the new address is
    refused, leave backoff in place and inspect the diagnostics.
 
+### Live validation — November 13, 2026
+
+Both runs used the local Mac against the live storefront with notifications
+suppressed and an isolated temporary history fixture. No production state or
+settings were accessed.
+
+| Run | Measured window | HTTP requests | HTTP requests/minute | Blocked |
+| --- | --- | --- | --- | --- |
+| Original `fd8b71c`, original loop cadence | 60.0003 seconds, 2 sweeps | 134 | 134.00 | 0 |
+| Tiered polling, defaults | 900 seconds (12:37:15–12:52:15 Pacific) | 150 | 10.00 | 0 |
+
+The new run made **135 scheduled page polls = 9.00 polls/minute**; the additional
+15 requests followed eyewear redirects to MIO LORD. The before/after HTTP counts
+include actual redirect traffic, which the earlier ~68 page-polls/minute estimate
+excluded. MIO LORD (`21978827FE50010`) was detected on all 15 eyewear polls.
+There were no fetch errors. The temporary history stayed byte-for-byte identical,
+and dry-run created no health file. The initial child sitemap was queued for a
+future cold slot, so this 15-minute run did not yet emit full-coverage success;
+full coverage and recovery timing also have deterministic clock tests.
+
+```text
+request accounting: window_seconds=900.0 requests=150 blocked=0 requests_per_minute=10.00 total_requests=150 total_blocked=0
+```
+
+Validation: `.venv/bin/python -m unittest -q` — 72 tests passed; `git diff --check`
+passed. Hourly production logs will establish the ongoing rate after discovery.
+
 ## Discord webhook
 
 Discord -> Server Settings -> Integrations -> Webhooks -> New Webhook -> pick a
